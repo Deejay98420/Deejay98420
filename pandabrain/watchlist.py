@@ -73,6 +73,9 @@ def record_check(db: Database, chain: str, pool: str, stage: str, reason: str | 
     elif reason:
         nxt = t + max(bench.MINUTES.get(reason, bench.DEFAULT_MINUTES), 5) * 60
         nxt = min(nxt, t + st["recheck_interval_minutes"] * 60 * 6)
+    elif stage == "judge":
+        # survived every gate but was not picked (or the book was busy): look again soon
+        nxt = t + min(300, st["recheck_interval_minutes"] * 60)
     else:
         nxt = t + st["recheck_interval_minutes"] * 60
     db.x("""UPDATE watchlist SET last_checked_at=?, next_check_at=?, status=?, last_stage=?,

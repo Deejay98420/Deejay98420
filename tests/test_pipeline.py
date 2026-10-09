@@ -176,3 +176,14 @@ class Watchlist(DeskCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Survivors(DeskCase):
+    def test_unpicked_survivor_is_rechecked_soon(self):
+        desk, w, db = self.make()
+        only(w, "BAMBOO", "JADE")
+        run_once_cli(desk)
+        held = book.position(db)["pool_address"]
+        other = db.q1("SELECT * FROM watchlist WHERE pool_address != ?", (held,))
+        self.assertEqual(other["last_stage"], "judge")
+        self.assertLessEqual(other["next_check_at"] - time.time(), 301)

@@ -170,8 +170,15 @@ The **SHADOW · PAPER ONLY** badge is always visible. **DEMO · SYNTHETIC DATA**
 demo book, which is a separate database file that refuses to open as the public book (and the
 reverse). Empty states stay empty: no fake profit history, no sample data posing as live.
 
-Screenshots: `docs/screenshots/` (desktop, mobile, drawer, book, health), captured from the demo
-book by the browser smoke test.
+Screenshots in `docs/screenshots/` were captured from a live **demo** book after about 16 minutes
+of real worker activity: one closed paper trade (BAMBOO, max hold, −$7.84 net of fees and
+slippage), then CUB, a token first rejected as `too_young`, matured on the watchlist and was picked.
+Files: `desktop.png` / `desktop-top.png`, `mobile.png` / `mobile-top.png` (390 px), `drawer.png`
+(JADE: `TOTAL_SUPPLY_VALUATION` evidence), `book.png`, `eventlog.png`, `settings.png`, `health.png`.
+
+| Desktop | Mobile |
+|---|---|
+| ![desktop](docs/screenshots/desktop-top.png) | ![mobile](docs/screenshots/mobile-top.png) |
 
 ---
 
@@ -213,7 +220,7 @@ shown by host only. Token names and descriptions are untrusted text: they are re
 
 ## Tests
 
-- `./scripts/test.sh` — **63 offline tests** (stdlib `unittest`, fixture transport, no network).
+- `./scripts/test.sh` — **65 offline tests** (stdlib `unittest`, fixture transport, no network).
   They cover raw supply/decimal scaling, invalid supply/decimals/non-finite values, provider market
   cap preference, distinct valuation labels, unsupported extensions, missing concentration, provider
   outages, watchlist maturation, exact-pool continuity across restart, stale data, one-position
