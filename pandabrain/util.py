@@ -85,6 +85,17 @@ def b58encode(b: bytes) -> str:
     return "1" * pad + out
 
 
+def b58decode(s: str) -> bytes:
+    if not isinstance(s, str) or not s or any(c not in _B58 for c in s):
+        raise ValueError("invalid base58")
+    n = 0
+    for c in s:
+        n = n * 58 + _B58.index(c)
+    body = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
+    pad = len(s) - len(s.lstrip("1"))
+    return b"\0" * pad + body
+
+
 def is_solana_address(s: str) -> bool:
     return isinstance(s, str) and bool(_B58_RE.match(s))
 

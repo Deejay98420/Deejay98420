@@ -23,6 +23,8 @@ MINUTES = {
     # facts that do not change while this token exists
     "mint_authority_open": 100_000, "freeze_authority_open": 100_000,
     "unsupported_extension": 100_000, "unsupported_program": 100_000, "not_a_mint": 100_000,
+    "token2022_layout_invalid": 1_440, "extension_truncated": 1_440, "extension_duplicate": 1_440,
+    "extension_malformed": 1_440, "mint_raw_invalid": 1_440,
     "evm_unverified": 1_440, "chain_unsupported": 1_440, "too_old": 100_000,
     # slow to change
     "largest_account_concentration": 90, "top10_concentration": 90, "low_holders": 90,
@@ -33,7 +35,7 @@ MINUTES = {
     "supply_valuation_above_max": 60, "judge_reject": 30, "stale_quote": 5,
     # provider faults: the token is not at fault, so only a short pause
     "rpc_unavailable": 10, "token_info_unavailable": 10, "mint_missing": 30,
-    "mint_view_mismatch": 30, "recently_closed": 60, "valuation_unavailable": 30, "valuation_invalid": 30,
+    "mint_view_mismatch": 30, "extension_view_mismatch": 30, "recently_closed": 60, "valuation_unavailable": 30, "valuation_invalid": 30,
 }
 DEFAULT_MINUTES = 45
 THRESHOLD_REASONS = {"too_young", "low_liquidity", "low_volume", "low_trades", "no_sells",

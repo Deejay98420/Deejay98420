@@ -21,7 +21,13 @@ def active_settings(db: Database) -> tuple[int, dict]:
         db.x("INSERT INTO settings_versions VALUES(1, ?, ?, ?)", (now(), jdump(s), "defaults"))
         return 1, s
     # merge over defaults so new keys added by a code upgrade get their default
-    return r["version"], config.validate(jload(r["settings_json"], {}), config.defaults())
+    stored = jload(r["settings_json"], {})
+    from .mint import SUPPORTED_NAMES
+    if isinstance(stored.get("allowed_token2022_extensions"), list):
+        # v3.0.1: entries outside the metadata-only set never had (and never will have) effect
+        stored["allowed_token2022_extensions"] = [x for x in stored["allowed_token2022_extensions"]
+                                                  if x in SUPPORTED_NAMES]
+    return r["version"], config.validate(stored, config.defaults())
 
 
 def save_settings(db: Database, patch: dict, note: str | None, expected_version: int | None) -> int:

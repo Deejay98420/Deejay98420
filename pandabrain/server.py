@@ -88,6 +88,13 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _err(self, code: int, msg: str):
+        if self.command == "POST" and not getattr(self, "_body_read", False):
+            # unread request body would desync a keep-alive connection: close it instead
+            self.close_connection = True
+            body = jdump({"error": sanitize(msg)}).encode()
+            self._headers(code, "application/json; charset=utf-8", len(body), {"Connection": "close"})
+            self.wfile.write(body)
+            return
         self._json(code, {"error": sanitize(msg)})
 
     def _host_ok(self) -> bool:
@@ -114,6 +121,7 @@ class Handler(BaseHTTPRequestHandler):
         if n > MAX_BODY:
             raise ValueError("body too large")
         raw = self.rfile.read(n) if n else b"{}"
+        self._body_read = True
         obj = json.loads(raw.decode("utf-8") or "{}")
         if not isinstance(obj, dict):
             raise ValueError("body must be an object")
@@ -225,6 +233,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------------ POST
     def do_POST(self):
+        self._body_read = False
         if not self._host_ok():
             return self._err(421, "host not allowed")
         bad = self._mutation_ok()

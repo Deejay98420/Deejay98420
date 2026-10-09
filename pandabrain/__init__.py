@@ -3,7 +3,7 @@
 No real execution exists in this package. Every fill is simulated.
 """
 
-__version__ = "3.0.0"
+__version__ = "3.0.1"
 
 # Hard constant. There is no setting, flag or environment variable that changes it.
 EXECUTION_MODE = "SHADOW_ONLY"

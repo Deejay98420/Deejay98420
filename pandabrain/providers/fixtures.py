@@ -17,13 +17,45 @@ import time
 from email.utils import formatdate
 from urllib.parse import unquote, urlparse
 
-from ..mint import TOKEN_2022_PROGRAM, TOKEN_PROGRAM
-from ..util import b58encode
+from ..mint import KNOWN_EXTENSION_NAMES, TOKEN_2022_PROGRAM, TOKEN_PROGRAM
+from ..util import b58decode, b58encode
 from .http import Response
 
 
 def addr(seed: str) -> str:
     return b58encode(hashlib.sha256(seed.encode()).digest())
+
+
+EXT_IDS = {v: k for k, v in KNOWN_EXTENSION_NAMES.items()}
+
+
+def _bstr(x: str) -> bytes:
+    b = x.encode()
+    return len(b).to_bytes(4, "little") + b
+
+
+def tlv_value(name: str, mint: bytes, sym: str = "X") -> bytes:
+    """Realistic extension values in the spl-token-2022 byte layout."""
+    if name == "metadataPointer":
+        return bytes(32) + mint                                   # no authority, points at the mint
+    if name == "tokenMetadata":
+        return bytes(32) + mint + _bstr(f"SYNTHETIC {sym}") + _bstr(sym) + _bstr("https://example.invalid/m.json") \
+            + (0).to_bytes(4, "little")
+    if name == "transferFeeConfig":
+        return bytes(108)
+    if name == "transferHook":
+        return bytes(64)
+    if name == "permanentDelegate":
+        return bytes(32)
+    return bytes(16)
+
+
+def token2022_tail(names, mint: bytes, sym: str = "X") -> bytes:
+    out = bytes(165 - 82) + bytes([1])
+    for n in names:
+        v = tlv_value(n, mint, sym)
+        out += EXT_IDS[n].to_bytes(2, "little") + len(v).to_bytes(2, "little") + v
+    return out
 
 
 def default_specs(t0: float) -> list[dict]:
@@ -125,8 +157,11 @@ class FixtureWorld:
         if s["freeze_auth"]:
             b[46:50] = (1).to_bytes(4, "little")
             b[50:82] = fa
-        if s["program"] == "2022" and s["extensions"]:
-            b += bytes(165 - 82) + bytes([1]) + bytes(40)
+        if s.get("raw_tail") is not None:                  # tests: hand-built raw region
+            return bytes(b) + s["raw_tail"]
+        raw_exts = s.get("raw_extensions", s["extensions"])
+        if s["program"] == "2022" and raw_exts:
+            b += token2022_tail(raw_exts, b58decode(s["token"]), s["sym"])
         return bytes(b)
 
     def mint_parsed(self, s):

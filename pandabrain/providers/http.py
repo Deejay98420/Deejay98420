@@ -17,7 +17,7 @@ from email.utils import parsedate_to_datetime
 
 from ..util import sanitize
 
-USER_AGENT = "PandaBrainDesk/3.0 (+local paper desk)"
+USER_AGENT = "PandaBrainDesk/3.0.1 (+local paper desk)"
 
 
 class ProviderError(Exception):

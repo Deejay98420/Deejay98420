@@ -1,4 +1,4 @@
-# The Pandarianz | PandaBrain Desk — v3.0.0
+# The Pandarianz | PandaBrain Desk — v3.0.1
 
 A local **SHADOW / PAPER-ONLY** bot trading desk. Six deterministic seats (SCAN, VET, SOCIAL, SIZE,
 FILLS, RISK) are coordinated by CHIEF (PandaBrain). They discover fresh Solana pools, verify mints,
@@ -14,16 +14,13 @@ dashboard backed by real APIs shows every seat, decision, rejection and fill.
 
 ---
 
-## Important: what this build is based on
+## What this build is based on
 
-The brief asked for `pandarianz-pandabrain-desk-v2-2.zip` to be extended. **That ZIP was not
-attached to the build session** (only the reference video and the panda artwork were). v3 is
-therefore a **clean re-implementation** of the v2.2 behaviour as described in the brief:
-GeckoTerminal discovery, DEX Screener quotes with exact GeckoTerminal pool fallback, verified Solana
-mint controls (including metadata-only Token-2022), deterministic rules, SQLite ledger, one paper
-position, leases, rejection cooldowns, risk monitoring and a CLI. The 52 v2.2 tests could not be run
-because their code was not available. See [MIGRATION.md](MIGRATION.md) for what this means for an
-existing v2.2 `desk.db`.
+v3.0.0 was written without the v2.2 source, which was not attached at the time. **v3.0.1 was
+reviewed against the actual v2.2 source** (`pandarianz-pandabrain-desk-v2-2.zip`). Its 52 tests run
+and pass unchanged. v2.2 `mint_controls.py` is the reference for the mint safeguards restored in
+this release. See [CHANGELOG.md](CHANGELOG.md) for exactly what changed and
+[MIGRATION.md](MIGRATION.md) for v2.2 ledger (`pandarianz.db`) compatibility.
 
 ---
 
@@ -35,8 +32,8 @@ Requires macOS with Python **3.10+** (`python3 --version`). Homebrew Python work
 ```bash
 # 1. unpack and enter
 cd ~/Downloads
-unzip pandarianz-pandabrain-desk-v3.0.0.zip
-cd pandarianz-pandabrain-desk-v3.0.0
+unzip pandarianz-pandabrain-desk-v3.0.1.zip
+cd pandarianz-pandabrain-desk-v3.0.1
 
 # 2. one-time setup (creates .env, migrates both books)
 ./scripts/setup.sh
@@ -57,6 +54,41 @@ cd pandarianz-pandabrain-desk-v3.0.0
 ./scripts/test.sh
 ```
 
+### Upgrading from v3.0.0 (keeps your v3 book)
+
+The v3 book schema is unchanged in 3.0.1. Stop the old desk, unpack 3.0.1 next to it, and copy
+the `data/` folder across (cash, position, trades, events and settings come with it):
+
+```bash
+cd ~/Downloads/pandarianz-pandabrain-desk-v3.0.0 && ./scripts/stop.sh; ./scripts/stop.sh --demo
+cd ~/Downloads && unzip pandarianz-pandabrain-desk-v3.0.1.zip
+cp -Rp pandarianz-pandabrain-desk-v3.0.0/data pandarianz-pandabrain-desk-v3.0.1/
+cd pandarianz-pandabrain-desk-v3.0.1 && cp -p ../pandarianz-pandabrain-desk-v3.0.0/.env . 2>/dev/null; ./scripts/setup.sh
+./scripts/start.sh
+```
+
+A paper position opened under 3.0.0 was vetted by the old parser. It stays open and RISK monitors
+and closes it as usual. Every new candidate is vetted by the 3.0.1 parser.
+
+### Preview a v2.2 ledger (read-only, no importer yet)
+
+v2.2 keeps its public ledger in `pandarianz.db` (and demo in `pandarianz-demo.db`) in the folder you
+ran `python3 main.py ...` from. Stop any running v2.2 worker first (Ctrl-C in its Terminal):
+
+```bash
+cd ~/Downloads/pandarianz-pandabrain-desk-v3.0.1
+python3 -m pandabrain migrate-preview --from "$HOME/Downloads/pandarianz-pandabrain-desk-v2/pandarianz-desk/pandarianz.db"
+# full machine-readable report:
+python3 -m pandabrain migrate-preview --from "$HOME/Downloads/pandarianz-pandabrain-desk-v2/pandarianz-desk/pandarianz.db" --json > v22-preview.json
+# if you changed BANK in v2.2 thresholds.py:  --starting-cash 25000
+```
+
+The preview hashes your ledger, reads only a temporary copy, re-hashes the original and reports
+`source unchanged by preview: True`. It creates no v3 book. It shows cash (reconciled against v2.2's
+own accounting), the open paper position, closed trades rebuilt from `paper_open`/`paper_close`
+pairs, every event by kind, and any blockers. Exit code 0 means no blockers, 1 means blockers
+were found. **Nothing is imported.** The importer will be built only after you've reviewed this output.
+
 If Python reports an SSL certificate error on python.org builds, run
 `/Applications/Python\ 3.*/Install\ Certificates.command` once.
 
@@ -67,6 +99,7 @@ python3 -m pandabrain run-once [--demo]          # one cycle (or one RISK check 
 python3 -m pandabrain status [--demo]            # JSON summary
 python3 -m pandabrain export-events --format csv # event log, no secrets
 python3 -m pandabrain serve --port 8800 --no-worker
+python3 -m pandabrain migrate-preview --from PATH   # read-only v2.2 ledger preview
 ```
 
 Optional configuration lives in `.env` (see `.env.example`): `SOLANA_RPC_URL`,
@@ -104,7 +137,8 @@ SCAN    GeckoTerminal new_pools (bounded pages)  ──►  durable watchlist (c
         (market cap is NOT checked here any more)
 VET     bounded dossiers (max_dossiers_per_cycle):
         GT token info → Solana RPC mint (jsonParsed + raw base64; must agree)
-        → mint/freeze authority, Token-2022 extensions → distribution / holders / largest account
+        → raw Token-2022 TLV validated byte by byte, raw/parsed extension sets must agree
+        → mint/freeze authority, metadata-only extensions → distribution / holders / largest account
         → VALUATION gate (below)
 SOCIAL  exact project-published handle only (GT token info). Adapter disconnected → gap recorded
 CHIEF   RULES or TYPED_AI judge → one pick or a recorded no-trade reason
@@ -130,6 +164,29 @@ pipeline without inventing numbers:
   `supply_valuation_max_usd`). This is a **new eligibility policy**, made explicit.
 - Provider FDV is never used as market cap.
 - EVM candidates are rejected as `evm_unverified` until verified controls and valuation exist for them.
+
+### Mint verification (restored v2.2 safeguards, stricter in 3.0.1)
+
+Each mint is read twice at `finalized` commitment: once as `jsonParsed` and once as raw base64.
+Both views must agree on program, supply, decimals, both authorities and the extension set.
+
+- The **whole raw Token-2022 region** is parsed:
+  - bytes 82–164 must be zero;
+  - byte 165 must be AccountType 1 (Mint);
+  - each TLV entry needs a complete 4-byte header and a value that fits;
+  - a type-0 terminator or zero tail ends the region, and any non-zero byte after it is rejected.
+- **Metadata-only policy**, hard-coded: only `metadataPointer` (18) and `tokenMetadata` (19) are
+  understood. Any other raw extension ID is `unsupported_extension` **from the raw bytes alone**,
+  whatever the parsed view reports. This includes transferFeeConfig, transferHook,
+  permanentDelegate, nonTransferable, pausable and unknown IDs.
+- **Lengths:**
+  - `metadataPointer` must be exactly 64 bytes;
+  - `tokenMetadata` is fully decoded: the authority, a mint field that must equal this mint,
+    UTF-8 name/symbol/uri, and additional fields, consuming every byte exactly.
+- **Settings can only narrow** `allowed_token2022_extensions`. Adding other names is refused by
+  settings validation, ignored if found in an old settings row, and has no effect on raw validation.
+- **Distinct reasons:** `unsupported_extension`, `extension_view_mismatch`, `extension_duplicate`,
+  `extension_truncated`, `extension_malformed`, `token2022_layout_invalid`, `mint_raw_invalid`.
 
 ### Distinct rejection reasons (examples)
 
@@ -186,7 +243,8 @@ Files: `desktop.png` / `desktop-top.png`, `mobile.png` / `mobile-top.png` (390 p
 
 **Completed and working**
 - Discovery → watchlist → exact-pool quotes → pre-dossier arithmetic → bounded VET → valuation gate
-- Solana mint verification: parsed/raw agreement, authorities, Token-2022 extension allow-list (metadata-only)
+- Solana mint verification: parsed/raw agreement at `finalized`, full raw Token-2022 TLV validation, metadata-only policy that settings cannot widen
+- Read-only v2.2 ledger migration preview (`migrate-preview`), with no importer yet
 - `TOTAL_SUPPLY_VALUATION` with Decimal, separate limits; provider market cap preferred
 - Policy-aware cooldowns, durable watchlist with maturation, request budgets and rate limiting
 - RULES judge; TYPED_AI adapter with strict validation and no fallback (code complete, tested against a contract fake)
@@ -220,13 +278,15 @@ shown by host only. Token names and descriptions are untrusted text: they are re
 
 ## Tests
 
-- `./scripts/test.sh` — **65 offline tests** (stdlib `unittest`, fixture transport, no network).
+- `./scripts/test.sh` — **107 offline tests** (stdlib `unittest`, fixture transport, no network).
   They cover raw supply/decimal scaling, invalid supply/decimals/non-finite values, provider market
   cap preference, distinct valuation labels, unsupported extensions, missing concentration, provider
   outages, watchlist maturation, exact-pool continuity across restart, stale data, one-position
   enforcement, lease collisions, no scanning while held, idempotent open/close, empty stats,
   demo/public isolation, live-execution blocking, TYPED_AI schema validation, no fallback, settings
-  versioning, the HTTP API, CSRF and the event stream.
+  versioning, the HTTP API, CSRF and the event stream; 3.0.1 adds 33 raw-mint regression tests
+  (including the reported transferFeeConfig disagreement) and 9 read-only migration-preview tests
+  built from rows produced by the actual v2.2 code.
 - `tests/browser/smoke.mjs` — browser smoke test: starts a demo server, clicks **Run once**, waits
   for real backend changes in the DOM, opens the drawer and tabs, checks for horizontal overflow at
   390 px, and saves screenshots.

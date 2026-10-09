@@ -1,5 +1,8 @@
 """Solana JSON-RPC. Endpoint is configurable via SOLANA_RPC_URL; it is never logged in full
 (paid RPC URLs embed keys), only its host.
+
+Mint evidence is read at `finalized` commitment, as in the v2.2 safeguards: a rolled-back slot
+can never make a mint look safer than it is.
 """
 
 from __future__ import annotations
@@ -11,6 +14,7 @@ from .http import Budget, Http, ProviderError
 
 DEFAULT_RPC = "https://api.mainnet-beta.solana.com"
 NAME = "solana_rpc"
+COMMITMENT = "finalized"
 
 
 def rpc_url() -> str:
@@ -42,10 +46,10 @@ class SolanaRpc:
         return body["result"]
 
     def account_parsed(self, addr: str, budget: Budget | None):
-        return self.call("getAccountInfo", [addr, {"encoding": "jsonParsed", "commitment": "confirmed"}], budget)
+        return self.call("getAccountInfo", [addr, {"encoding": "jsonParsed", "commitment": COMMITMENT}], budget)
 
     def account_raw(self, addr: str, budget: Budget | None):
-        return self.call("getAccountInfo", [addr, {"encoding": "base64", "commitment": "confirmed"}], budget)
+        return self.call("getAccountInfo", [addr, {"encoding": "base64", "commitment": COMMITMENT}], budget)
 
     def largest_accounts(self, mint: str, budget: Budget | None):
-        return self.call("getTokenLargestAccounts", [mint, {"commitment": "confirmed"}], budget)
+        return self.call("getTokenLargestAccounts", [mint, {"commitment": COMMITMENT}], budget)

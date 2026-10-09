@@ -1,0 +1,108 @@
+{
+ "_note": "Rows produced by the actual v2.2 code (Book + Desk + DemoCollector, synthetic tokens) in a PUBLIC_MARKET_DATA-bound ledger: one take-profit close, then a re-open whose next quote failed. Used to test the read-only v2.2 migration preview.",
+ "schema": [
+  "CREATE TABLE account(id INTEGER PRIMARY KEY CHECK(id=1), cash REAL)",
+  "CREATE TABLE bench(tid TEXT PRIMARY KEY, reason TEXT, until REAL)",
+  "CREATE TABLE events(id INTEGER PRIMARY KEY, at REAL, kind TEXT, payload TEXT)",
+  "CREATE TABLE lease(id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT, until REAL)",
+  "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT)",
+  "CREATE TABLE position(id INTEGER PRIMARY KEY CHECK(id=1), payload TEXT)"
+ ],
+ "metadata": [
+  [
+   "engine",
+   "PANDARIANZ_BRAIN_RULES_2.0.0"
+  ],
+  [
+   "feed",
+   "PUBLIC_MARKET_DATA"
+  ]
+ ],
+ "account": [
+  [
+   1,
+   9889.000415841583
+  ]
+ ],
+ "position": [
+  [
+   1,
+   "{\"token\": {\"chain\": \"solana\", \"addr\": \"DEMO_A\", \"net\": 1399811149, \"tid\": \"solana:DEMO_A\", \"ticker\": \"PANDA\", \"pair\": \"DEMO_A\", \"price_usd\": 1.0, \"observed_at\": 1791587197.57581, \"age_minutes\": 45, \"liquidity_usd\": 100000.0, \"mcap_usd\": 200000.0, \"volume_h24\": 100000.0, \"volume_h6\": 25000.0, \"trades_h24\": 600, \"buys_h1\": 100, \"sells_h1\": 40, \"buys_h6\": 400, \"sells_h6\": 160, \"change\": {\"m5\": 2, \"h1\": 8, \"h24\": 10}, \"source\": \"DEMO_SYNTHETIC\", \"holder_count\": 500, \"top_10_fraction\": 0.25, \"top_account_fraction\": 0.03, \"authorities_verified\": true, \"mint_authority\": null, \"freeze_authority\": null, \"is_honeypot\": null, \"x_account\": {\"handle\": \"demo\", \"observed_at\": 1791587197.5758333, \"followers\": 1000, \"recent\": []}, \"x_handle\": \"demo\"}, \"evaluation\": {\"engine\": \"PANDARIANZ_BRAIN_RULES_2.0.0\", \"score_type\": \"RULE_SCORE_NOT_PROBABILITY\", \"score\": 80.24, \"eligible\": true, \"reasons\": [], \"components\": {\"flow\": 28.5714, \"momentum\": 25.0, \"distribution\": 11.6667, \"liquidity\": 15.0}, \"metrics\": {\"buy_share_h1\": 0.7142857142857143, \"buy_share_h6\": 0.7142857142857143, \"change_m5_percent\": 2.0, \"change_h1_percent\": 8.0, \"volume_ratio_h6\": 1.0, \"top_10_fraction\": 0.25, \"top_account_fraction\": 0.03}, \"social_status\": \"fresh_exact_handle_import\", \"social_authenticity\": \"NOT_ASSESSED\"}, \"engine\": \"PANDARIANZ_BRAIN_RULES_2.0.0\", \"size_factor\": 1.0, \"ticket\": 201.83572277227722, \"entry_fee\": 0.95, \"entry_price\": 1.01, \"units\": 199.8373492794824, \"opened_at\": 1791587197.5782664, \"missing_checks\": 1, \"mode\": \"SHADOW_SIMULATION\", \"fill_assumption\": \"last spot price plus configured slippage; no order-book or route simulation\", \"close_required\": false}"
+  ]
+ ],
+ "events": [
+  [
+   1,
+   1791587197.5694532,
+   "brain_evaluation",
+   "{\"tid\": \"solana:DEMO_A\", \"state\": {\"chain\": \"solana\", \"addr\": \"DEMO_A\", \"net\": 1399811149, \"tid\": \"solana:DEMO_A\", \"ticker\": \"PANDA\", \"pair\": \"DEMO_A\", \"price_usd\": 1.0, \"observed_at\": 1791587197.5693684, \"age_minutes\": 45, \"liquidity_usd\": 100000.0, \"mcap_usd\": 200000.0, \"volume_h24\": 100000.0, \"volume_h6\": 25000.0, \"trades_h24\": 600, \"buys_h1\": 100, \"sells_h1\": 40, \"buys_h6\": 400, \"sells_h6\": 160, \"change\": {\"m5\": 2, \"h1\": 8, \"h24\": 10}, \"source\": \"DEMO_SYNTHETIC\", \"holder_count\": 500, \"top_10_fraction\": 0.25, \"top_account_fraction\": 0.03, \"authorities_verified\": true, \"mint_authority\": null, \"freeze_authority\": null, \"is_honeypot\": null, \"x_account\": {\"handle\": \"demo\", \"observed_at\": 1791587197.5694017, \"followers\": 1000, \"recent\": []}, \"x_handle\": \"demo\"}, \"evaluation\": {\"engine\": \"PANDARIANZ_BRAIN_RULES_2.0.0\", \"score_type\": \"RULE_SCORE_NOT_PROBABILITY\", \"score\": 80.24, \"eligible\": true, \"reasons\": [], \"components\": {\"flow\": 28.5714, \"momentum\": 25.0, \"distribution\": 11.6667, \"liquidity\": 15.0}, \"metrics\": {\"buy_share_h1\": 0.7142857142857143, \"buy_share_h6\": 0.7142857142857143, \"change_m5_percent\": 2.0, \"change_h1_percent\": 8.0, \"volume_ratio_h6\": 1.0, \"top_10_fraction\": 0.25, \"top_account_fraction\": 0.03}, \"social_status\": \"fresh_exact_handle_import\", \"social_authenticity\": \"NOT_ASSESSED\"}}"
+  ],
+  [
+   2,
+   1791587197.570376,
+   "brain_evaluation",
+   "{\"tid\": \"solana:DEMO_B\", \"state\": {\"chain\": \"solana\", \"addr\": \"DEMO_B\", \"net\": 1399811149, \"tid\": \"solana:DEMO_B\", \"ticker\": \"PANDA\", \"pair\": \"DEMO_B\", \"price_usd\": 1.0, \"observed_at\": 1791587197.5703204, \"age_minutes\": 45, \"liquidity_usd\": 100000.0, \"mcap_usd\": 200000.0, \"volume_h24\": 100000.0, \"volume_h6\": 25000.0, \"trades_h24\": 600, \"buys_h1\": 100, \"sells_h1\": 40, \"buys_h6\": 400, \"sells_h6\": 160, \"change\": {\"m5\": 2, \"h1\": 8, \"h24\": 10}, \"source\": \"DEMO_SYNTHETIC\", \"holder_count\": 500, \"top_10_fraction\": 0.25, \"top_account_fraction\": 0.03, \"authorities_verified\": true, \"mint_authority\": null, \"freeze_authority\": null, \"is_honeypot\": null, \"x_account\": {\"handle\": \"demo\", \"observed_at\": 1791587197.5703413, \"followers\": 1000, \"recent\": []}, \"x_handle\": \"demo\"}, \"evaluation\": {\"engine\": \"PANDARIANZ_BRAIN_RULES_2.0.0\", \"score_type\": \"RULE_SCORE_NOT_PROBABILITY\", \"score\": 80.24, \"eligible\": true, \"reasons\": [], \"components\": {\"flow\": 28.5714, \"momentum\": 25.0, \"distribution\": 11.6667, \"liquidity\": 15.0}, \"metrics\": {\"buy_share_h1\": 0.7142857142857143, \"buy_share_h6\": 0.7142857142857143, \"change_m5_percent\": 2.0, \"change_h1_percent\": 8.0, \"volume_ratio_h6\": 1.0, \"top_10_fraction\": 0.25, \"top_account_fraction\": 0.03}, \"social_status\": \"fresh_exact_handle_import\", \"social_authenticity\": \"NOT_ASSESSED\"}}"
+  ],
+  [
+   3,
+   1791587197.5713658,
+   "brain_selection",
+   "{\"token\": {\"chain\": \"solana\", \"addr\": \"DEMO_A\", \"net\": 1399811149, \"tid\": \"solana:DEMO_A\", \"ticker\": \"PANDA\", \"pair\": \"DEMO_A\", \"price_usd\": 1.0, \"observed_at\": 1791587197.5693684, \"age_minutes\": 45, \"liquidity_usd\": 100000.0, \"mcap_usd\": 200000.0, \"volume_h24\": 100000.0, \"volume_h6\": 25000.0, \"trades_h24\": 600, \"buys_h1\": 100, \"sells_h1\": 40, \"buys_h6\": 400, \"sells_h6\": 160, \"change\": {\"m5\": 2, \"h1\": 8, \"h24\": 10}, \"source\": \"DEMO_SYNTHETIC\", \"holder_count\": 500, \"top_10_fraction\": 0.25, \"top_account_fraction\": 0.03, \"authorities_verified\": true, \"mint_authority\": null, \"freeze_authority\": null, \"is_honeypot\": null, \"x_account\": {\"handle\": \"demo\", \"observed_at\": 1791587197.5694017, \"followers\": 1000, \"recent\": []}, \"x_handle\": \"demo\"}, \"evaluation\": {\"engine\": \"PANDARIANZ_BRAIN_RULES_2.0.0\", \"score_type\": \"RULE_SCORE_NOT_PROBABILITY\", \"score\": 80.24, \"eligible\": true, \"reasons\": [], \"components\": {\"flow\": 28.5714, \"momentum\": 25.0, \"distribution\": 11.6667, \"liquidity\": 15.0}, \"metrics\": {\"buy_share_h1\": 0.7142857142857143, \"buy_share_h6\": 0.7142857142857143, \"change_m5_percent\": 2.0, \"change_h1_percent\": 8.0, \"volume_ratio_h6\": 1.0, \"top_10_fraction\": 0.25, \"top_account_fraction\": 0.03}, \"social_status\": \"fresh_exact_handle_import\", \"social_authenticity\": \"NOT_ASSESSED\"}, \"engine\": \"PANDARIANZ_BRAIN_RULES_2.0.0\", \"size_factor\": 1.0}"
+  ],
+  [
+   4,
+   1791587197.5721745,
+   "paper_open",
+   "{\"token\": {\"chain\": \"solana\", \"addr\": \"DEMO_A\", \"net\": 1399811149, \"tid\": \"solana:DEMO_A\", \"ticker\": \"PANDA\", \"pair\": \"DEMO_A\", \"price_usd\": 1.0, \"observed_at\": 1791587197.5693684, \"age_minutes\": 45, \"liquidity_usd\": 100000.0, \"mcap_usd\": 200000.0, \"volume_h24\": 100000.0, \"volume_h6\": 25000.0, \"trades_h24\": 600, \"buys_h1\": 100, \"sells_h1\": 40, \"buys_h6\": 400, \"sells_h6\": 160, \"change\": {\"m5\": 2, \"h1\": 8, \"h24\": 10}, \"source\": \"DEMO_SYNTHETIC\", \"holder_count\": 500, \"top_10_fraction\": 0.25, \"top_account_fraction\": 0.03, \"authorities_verified\": true, \"mint_authority\": null, \"freeze_authority\": null, \"is_honeypot\": null, \"x_account\": {\"handle\": \"demo\", \"observed_at\": 1791587197.5694017, \"followers\": 1000, \"recent\": []}, \"x_handle\": \"demo\"}, \"evaluation\": {\"engine\": \"PANDARIANZ_BRAIN_RULES_2.0.0\", \"score_type\": \"RULE_SCORE_NOT_PROBABILITY\", \"score\": 80.24, \"eligible\": true, \"reasons\": [], \"components\": {\"flow\": 28.5714, \"momentum\": 25.0, \"distribution\": 11.6667, \"liquidity\": 15.0}, \"metrics\": {\"buy_share_h1\": 0.7142857142857143, \"buy_share_h6\": 0.7142857142857143, \"change_m5_percent\": 2.0, \"change_h1_percent\": 8.0, \"volume_ratio_h6\": 1.0, \"top_10_fraction\": 0.25, \"top_account_fraction\": 0.03}, \"social_status\": \"fresh_exact_handle_import\", \"social_authenticity\": \"NOT_ASSESSED\"}, \"engine\": \"PANDARIANZ_BRAIN_RULES_2.0.0\", \"size_factor\": 1.0, \"ticket\": 200.0, \"entry_fee\": 0.95, \"entry_price\": 1.01, \"units\": 198.01980198019803, \"opened_at\": 1791587197.572054, \"missing_checks\": 0, \"mode\": \"SHADOW_SIMULATION\", \"fill_assumption\": \"last spot price plus configured slippage; no order-book or route simulation\"}"
+  ],
+  [
+   5,
+   1791587197.572577,
+   "cycle",
+   "{\"brand\": \"The Pandarianz | PandaBrain Desk v2.2\", \"engine\": \"PANDARIANZ_BRAIN_RULES_2.0.0\", \"mode\": \"SHADOW_ONLY\", \"status\": \"paper_opened\", \"counts\": {\"seen\": 2, \"benched\": 0, \"dossiers\": 2, \"evaluated\": 2, \"qualified\": 2, \"rejected\": {}}, \"tid\": \"solana:DEMO_A\", \"score\": 80.24, \"score_type\": \"RULE_SCORE_NOT_PROBABILITY\"}"
+  ],
+  [
+   6,
+   1791587197.5739152,
+   "paper_close",
+   "{\"tid\": \"solana:DEMO_A\", \"reason\": \"take_profit\", \"entry_price\": 1.01, \"exit_price\": 1.4849999999999999, \"ticket\": 200.0, \"entry_fee\": 0.95, \"exit_fee\": 1.323267326732673, \"net_pnl\": 91.78613861386138, \"mode\": \"SHADOW_SIMULATION\", \"closed_at\": 1791587197.5738728, \"engine\": \"PANDARIANZ_BRAIN_RULES_2.0.0\", \"entry_evaluation\": {\"engine\": \"PANDARIANZ_BRAIN_RULES_2.0.0\", \"score_type\": \"RULE_SCORE_NOT_PROBABILITY\", \"score\": 80.24, \"eligible\": true, \"reasons\": [], \"components\": {\"flow\": 28.5714, \"momentum\": 25.0, \"distribution\": 11.6667, \"liquidity\": 15.0}, \"metrics\": {\"buy_share_h1\": 0.7142857142857143, \"buy_share_h6\": 0.7142857142857143, \"change_m5_percent\": 2.0, \"change_h1_percent\": 8.0, \"volume_ratio_h6\": 1.0, \"top_10_fraction\": 0.25, \"top_account_fraction\": 0.03}, \"social_status\": \"fresh_exact_handle_import\", \"social_authenticity\": \"NOT_ASSESSED\"}}"
+  ],
+  [
+   7,
+   1791587197.5758727,
+   "brain_evaluation",
+   "{\"tid\": \"solana:DEMO_A\", \"state\": {\"chain\": \"solana\", \"addr\": \"DEMO_A\", \"net\": 1399811149, \"tid\": \"solana:DEMO_A\", \"ticker\": \"PANDA\", \"pair\": \"DEMO_A\", \"price_usd\": 1.0, \"observed_at\": 1791587197.57581, \"age_minutes\": 45, \"liquidity_usd\": 100000.0, \"mcap_usd\": 200000.0, \"volume_h24\": 100000.0, \"volume_h6\": 25000.0, \"trades_h24\": 600, \"buys_h1\": 100, \"sells_h1\": 40, \"buys_h6\": 400, \"sells_h6\": 160, \"change\": {\"m5\": 2, \"h1\": 8, \"h24\": 10}, \"source\": \"DEMO_SYNTHETIC\", \"holder_count\": 500, \"top_10_fraction\": 0.25, \"top_account_fraction\": 0.03, \"authorities_verified\": true, \"mint_authority\": null, \"freeze_authority\": null, \"is_honeypot\": null, \"x_account\": {\"handle\": \"demo\", \"observed_at\": 1791587197.5758333, \"followers\": 1000, \"recent\": []}, \"x_handle\": \"demo\"}, \"evaluation\": {\"engine\": \"PANDARIANZ_BRAIN_RULES_2.0.0\", \"score_type\": \"RULE_SCORE_NOT_PROBABILITY\", \"score\": 80.24, \"eligible\": true, \"reasons\": [], \"components\": {\"flow\": 28.5714, \"momentum\": 25.0, \"distribution\": 11.6667, \"liquidity\": 15.0}, \"metrics\": {\"buy_share_h1\": 0.7142857142857143, \"buy_share_h6\": 0.7142857142857143, \"change_m5_percent\": 2.0, \"change_h1_percent\": 8.0, \"volume_ratio_h6\": 1.0, \"top_10_fraction\": 0.25, \"top_account_fraction\": 0.03}, \"social_status\": \"fresh_exact_handle_import\", \"social_authenticity\": \"NOT_ASSESSED\"}}"
+  ],
+  [
+   8,
+   1791587197.5767665,
+   "brain_evaluation",
+   "{\"tid\": \"solana:DEMO_B\", \"state\": {\"chain\": \"solana\", \"addr\": \"DEMO_B\", \"net\": 1399811149, \"tid\": \"solana:DEMO_B\", \"ticker\": \"PANDA\", \"pair\": \"DEMO_B\", \"price_usd\": 1.0, \"observed_at\": 1791587197.5767262, \"age_minutes\": 45, \"liquidity_usd\": 100000.0, \"mcap_usd\": 200000.0, \"volume_h24\": 100000.0, \"volume_h6\": 25000.0, \"trades_h24\": 600, \"buys_h1\": 100, \"sells_h1\": 40, \"buys_h6\": 400, \"sells_h6\": 160, \"change\": {\"m5\": 2, \"h1\": 8, \"h24\": 10}, \"source\": \"DEMO_SYNTHETIC\", \"holder_count\": 500, \"top_10_fraction\": 0.25, \"top_account_fraction\": 0.03, \"authorities_verified\": true, \"mint_authority\": null, \"freeze_authority\": null, \"is_honeypot\": null, \"x_account\": {\"handle\": \"demo\", \"observed_at\": 1791587197.576741, \"followers\": 1000, \"recent\": []}, \"x_handle\": \"demo\"}, \"evaluation\": {\"engine\": \"PANDARIANZ_BRAIN_RULES_2.0.0\", \"score_type\": \"RULE_SCORE_NOT_PROBABILITY\", \"score\": 80.24, \"eligible\": true, \"reasons\": [], \"components\": {\"flow\": 28.5714, \"momentum\": 25.0, \"distribution\": 11.6667, \"liquidity\": 15.0}, \"metrics\": {\"buy_share_h1\": 0.7142857142857143, \"buy_share_h6\": 0.7142857142857143, \"change_m5_percent\": 2.0, \"change_h1_percent\": 8.0, \"volume_ratio_h6\": 1.0, \"top_10_fraction\": 0.25, \"top_account_fraction\": 0.03}, \"social_status\": \"fresh_exact_handle_import\", \"social_authenticity\": \"NOT_ASSESSED\"}}"
+  ],
+  [
+   9,
+   1791587197.5777757,
+   "brain_selection",
+   "{\"token\": {\"chain\": \"solana\", \"addr\": \"DEMO_A\", \"net\": 1399811149, \"tid\": \"solana:DEMO_A\", \"ticker\": \"PANDA\", \"pair\": \"DEMO_A\", \"price_usd\": 1.0, \"observed_at\": 1791587197.57581, \"age_minutes\": 45, \"liquidity_usd\": 100000.0, \"mcap_usd\": 200000.0, \"volume_h24\": 100000.0, \"volume_h6\": 25000.0, \"trades_h24\": 600, \"buys_h1\": 100, \"sells_h1\": 40, \"buys_h6\": 400, \"sells_h6\": 160, \"change\": {\"m5\": 2, \"h1\": 8, \"h24\": 10}, \"source\": \"DEMO_SYNTHETIC\", \"holder_count\": 500, \"top_10_fraction\": 0.25, \"top_account_fraction\": 0.03, \"authorities_verified\": true, \"mint_authority\": null, \"freeze_authority\": null, \"is_honeypot\": null, \"x_account\": {\"handle\": \"demo\", \"observed_at\": 1791587197.5758333, \"followers\": 1000, \"recent\": []}, \"x_handle\": \"demo\"}, \"evaluation\": {\"engine\": \"PANDARIANZ_BRAIN_RULES_2.0.0\", \"score_type\": \"RULE_SCORE_NOT_PROBABILITY\", \"score\": 80.24, \"eligible\": true, \"reasons\": [], \"components\": {\"flow\": 28.5714, \"momentum\": 25.0, \"distribution\": 11.6667, \"liquidity\": 15.0}, \"metrics\": {\"buy_share_h1\": 0.7142857142857143, \"buy_share_h6\": 0.7142857142857143, \"change_m5_percent\": 2.0, \"change_h1_percent\": 8.0, \"volume_ratio_h6\": 1.0, \"top_10_fraction\": 0.25, \"top_account_fraction\": 0.03}, \"social_status\": \"fresh_exact_handle_import\", \"social_authenticity\": \"NOT_ASSESSED\"}, \"engine\": \"PANDARIANZ_BRAIN_RULES_2.0.0\", \"size_factor\": 1.0}"
+  ],
+  [
+   10,
+   1791587197.578373,
+   "paper_open",
+   "{\"token\": {\"chain\": \"solana\", \"addr\": \"DEMO_A\", \"net\": 1399811149, \"tid\": \"solana:DEMO_A\", \"ticker\": \"PANDA\", \"pair\": \"DEMO_A\", \"price_usd\": 1.0, \"observed_at\": 1791587197.57581, \"age_minutes\": 45, \"liquidity_usd\": 100000.0, \"mcap_usd\": 200000.0, \"volume_h24\": 100000.0, \"volume_h6\": 25000.0, \"trades_h24\": 600, \"buys_h1\": 100, \"sells_h1\": 40, \"buys_h6\": 400, \"sells_h6\": 160, \"change\": {\"m5\": 2, \"h1\": 8, \"h24\": 10}, \"source\": \"DEMO_SYNTHETIC\", \"holder_count\": 500, \"top_10_fraction\": 0.25, \"top_account_fraction\": 0.03, \"authorities_verified\": true, \"mint_authority\": null, \"freeze_authority\": null, \"is_honeypot\": null, \"x_account\": {\"handle\": \"demo\", \"observed_at\": 1791587197.5758333, \"followers\": 1000, \"recent\": []}, \"x_handle\": \"demo\"}, \"evaluation\": {\"engine\": \"PANDARIANZ_BRAIN_RULES_2.0.0\", \"score_type\": \"RULE_SCORE_NOT_PROBABILITY\", \"score\": 80.24, \"eligible\": true, \"reasons\": [], \"components\": {\"flow\": 28.5714, \"momentum\": 25.0, \"distribution\": 11.6667, \"liquidity\": 15.0}, \"metrics\": {\"buy_share_h1\": 0.7142857142857143, \"buy_share_h6\": 0.7142857142857143, \"change_m5_percent\": 2.0, \"change_h1_percent\": 8.0, \"volume_ratio_h6\": 1.0, \"top_10_fraction\": 0.25, \"top_account_fraction\": 0.03}, \"social_status\": \"fresh_exact_handle_import\", \"social_authenticity\": \"NOT_ASSESSED\"}, \"engine\": \"PANDARIANZ_BRAIN_RULES_2.0.0\", \"size_factor\": 1.0, \"ticket\": 201.83572277227722, \"entry_fee\": 0.95, \"entry_price\": 1.01, \"units\": 199.8373492794824, \"opened_at\": 1791587197.5782664, \"missing_checks\": 0, \"mode\": \"SHADOW_SIMULATION\", \"fill_assumption\": \"last spot price plus configured slippage; no order-book or route simulation\"}"
+  ],
+  [
+   11,
+   1791587197.5787935,
+   "cycle",
+   "{\"brand\": \"The Pandarianz | PandaBrain Desk v2.2\", \"engine\": \"PANDARIANZ_BRAIN_RULES_2.0.0\", \"mode\": \"SHADOW_ONLY\", \"status\": \"paper_opened\", \"counts\": {\"seen\": 2, \"benched\": 0, \"dossiers\": 2, \"evaluated\": 2, \"qualified\": 2, \"rejected\": {}}, \"tid\": \"solana:DEMO_A\", \"score\": 80.24, \"score_type\": \"RULE_SCORE_NOT_PROBABILITY\"}"
+  ],
+  [
+   12,
+   1791587197.580037,
+   "risk_data_unavailable",
+   "{\"tid\": \"solana:DEMO_A\", \"checks\": 1, \"status\": \"retry_pending\"}"
+  ]
+ ],
+ "bench": []
+}

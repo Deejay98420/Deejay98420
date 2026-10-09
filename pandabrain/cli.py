@@ -5,6 +5,7 @@
   python3 -m pandabrain status [--demo]
   python3 -m pandabrain migrate [--demo]
   python3 -m pandabrain export-events [--demo] [--format csv|json]
+  python3 -m pandabrain migrate-preview --from ~/path/to/pandarianz.db [--json] [--starting-cash 10000]
 """
 
 from __future__ import annotations
@@ -61,7 +62,11 @@ def make_desk(demo: bool) -> Desk:
 def main(argv=None):
     load_env(os.path.join(ROOT, ".env"))
     ap = argparse.ArgumentParser(prog="pandabrain", description=f"PandaBrain Desk {__version__} ({EXECUTION_MODE})")
-    ap.add_argument("command", choices=["serve", "run-once", "status", "migrate", "export-events"])
+    ap.add_argument("command", choices=["serve", "run-once", "status", "migrate", "export-events",
+                                        "migrate-preview"])
+    ap.add_argument("--from", dest="source", help="migrate-preview: path to a v2.2 pandarianz.db")
+    ap.add_argument("--starting-cash", default="10000", help="migrate-preview: v2.2 BANK (thresholds.py)")
+    ap.add_argument("--json", action="store_true", help="migrate-preview: full JSON report")
     ap.add_argument("--demo", action="store_true", help="synthetic fixture world in its own book")
     ap.add_argument("--host", default=os.environ.get("PANDABRAIN_HOST", "127.0.0.1"))
     ap.add_argument("--port", type=int, default=int(os.environ.get("PANDABRAIN_PORT", "8765")))
@@ -72,6 +77,22 @@ def main(argv=None):
     if a.host not in ("127.0.0.1", "localhost", "::1") and os.environ.get("PANDABRAIN_ALLOW_REMOTE") != "1":
         print("refusing to bind a non-local address (set PANDABRAIN_ALLOW_REMOTE=1 to override)", file=sys.stderr)
         return 2
+    if a.command == "migrate-preview":
+        # read-only: does not open or create any v3 book, and only reads a temporary copy of the source
+        from decimal import Decimal, InvalidOperation
+        from .legacy_v22 import PreviewError, preview, summary_text
+        if not a.source:
+            print("usage: python3 -m pandabrain migrate-preview --from /path/to/pandarianz.db", file=sys.stderr)
+            return 2
+        try:
+            bank = Decimal(a.starting_cash)
+            r = preview(a.source, bank, os.environ.get("PANDABRAIN_DATA_DIR") or os.path.join(ROOT, "data"))
+        except (PreviewError, InvalidOperation) as e:
+            print(f"preview failed: {e}", file=sys.stderr)
+            return 2
+        print(json.dumps(r, indent=2, default=str) if a.json else summary_text(r))
+        return 0 if r["ready_for_import"] else 1
+
     try:
         desk = make_desk(a.demo)
     except ModeMismatch as e:

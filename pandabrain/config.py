@@ -41,7 +41,9 @@ SCHEMA: dict[str, tuple] = {
     "require_distribution": ("bool", None, None, True, "vet",
                              "Reject when holder distribution is unavailable"),
     "allowed_token2022_extensions": ("list", None, None, ["metadataPointer", "tokenMetadata"],
-                                     "vet", "Token-2022 extensions treated as metadata-only"),
+                                     "vet", "Token-2022 extensions to accept. Can only NARROW the "
+                                     "supported metadata-only set (metadataPointer, tokenMetadata); "
+                                     "raw bytes are always validated regardless of this list."),
     # --- valuation (post-dossier) -----------------------------------------------------------
     "mcap_min_usd": ("float", 0, 1e12, 60_000, "valuation",
                      "Provider-reported market cap minimum (USD)"),
@@ -162,6 +164,11 @@ def validate(patch: dict, base: dict | None = None) -> dict:
     if not errors:
         if out["judge_engine"] not in JUDGE_ENGINES:
             errors["judge_engine"] = "must be RULES or TYPED_AI"
+        from .mint import SUPPORTED_NAMES
+        ext_bad = [x for x in out["allowed_token2022_extensions"] if x not in SUPPORTED_NAMES]
+        if ext_bad:
+            errors["allowed_token2022_extensions"] = (f"unsupported {ext_bad}: only "
+                                                      f"{sorted(SUPPORTED_NAMES)} can be allowed")
         bad = [c for c in out["chains"] if c not in KNOWN_CHAINS]
         if bad or not out["chains"]:
             errors["chains"] = f"unknown chains {bad}" if bad else "at least one chain"
