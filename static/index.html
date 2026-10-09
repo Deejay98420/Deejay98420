@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="desk-token" content="__DESK_TOKEN__">
+<meta name="color-scheme" content="dark">
+<title>PandaBrain Desk</title>
+<link rel="icon" href="/static/assets/favicon.png">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<svg class="sprite" width="0" height="0" aria-hidden="true">
+  <defs>
+    <symbol id="panda" viewBox="0 0 64 64">
+      <circle cx="14" cy="14" r="10" fill="#0b0d0c"/>
+      <circle cx="50" cy="14" r="10" fill="#0b0d0c"/>
+      <ellipse cx="32" cy="35" rx="25" ry="23" fill="#eef1ec"/>
+      <ellipse cx="21" cy="33" rx="8" ry="10" transform="rotate(-22 21 33)" fill="#0b0d0c"/>
+      <ellipse cx="43" cy="33" rx="8" ry="10" transform="rotate(22 43 33)" fill="#0b0d0c"/>
+      <circle cx="22" cy="33" r="3.4" fill="currentColor"/>
+      <circle cx="42" cy="33" r="3.4" fill="currentColor"/>
+      <ellipse cx="32" cy="45" rx="5" ry="3.4" fill="#0b0d0c"/>
+    </symbol>
+  </defs>
+</svg>
+
+<header class="top">
+  <div class="brand">
+    <img src="/static/assets/pandarianz.jpg" alt="Pandarianz panda" class="logo" width="44" height="44">
+    <div class="brand-text">
+      <div class="brand-kicker">THE PANDARIANZ</div>
+      <div class="brand-name">PANDABRAIN <span>DESK</span></div>
+    </div>
+    <div class="tagline">code fetches · the brain judges · code decides</div>
+  </div>
+  <div class="top-right">
+    <span class="badge badge-shadow" id="modeBadge" title="No real orders can be placed by this build">SHADOW · PAPER ONLY</span>
+    <span class="badge badge-demo" id="demoBadge" hidden title="Synthetic fixture world, separate book">DEMO · SYNTHETIC DATA</span>
+    <span class="badge" id="engineBadge">ENGINE —</span>
+    <span class="clock" id="clock" aria-label="UTC time">--:--:-- UTC</span>
+  </div>
+</header>
+
+<section class="controls" aria-label="Desk controls">
+  <button id="btnScan" class="btn" data-action="scan">Start scanning</button>
+  <button id="btnRun" class="btn" data-action="run">Run once</button>
+  <button id="btnWorker" class="btn btn-ghost" data-action="worker">Stop worker</button>
+  <div class="ctl-status">
+    <span class="dot" id="workerDot"></span><span id="workerText">connecting…</span>
+    <span class="sep">·</span><span id="nextCycle">—</span>
+    <span class="sep">·</span><span id="streamText">stream —</span>
+  </div>
+  <div class="ctl-msg" id="ctlMsg" role="status" aria-live="polite"></div>
+</section>
+
+<section class="seats" id="seats" aria-label="Seats"></section>
+
+<section class="panel floor-panel">
+  <div class="panel-head">
+    <span id="tickerLine" class="ticker">CASH — · EQUITY — · TRADES — · CYCLE —</span>
+    <span class="muted small">seat avatars move on real backend events</span>
+  </div>
+  <div class="floor-wrap"><svg id="floor" viewBox="0 0 1200 470" role="img" aria-label="Desk floor showing seat states"></svg></div>
+</section>
+
+<section class="panel balance-panel">
+  <div class="panel-head">
+    <span class="title">BALANCE · PAPER</span>
+    <span class="muted small" id="balanceBasis">mark-to-market before exit costs</span>
+    <span class="right small" id="statLine">—</span>
+  </div>
+  <div class="balance-body">
+    <svg id="equityChart" viewBox="0 0 1000 180" preserveAspectRatio="none" role="img" aria-label="Paper equity"></svg>
+    <div class="balance-figure"><div class="muted small">EQUITY</div><div id="equityNow" class="big">—</div>
+      <div class="muted small" id="cashNow">cash —</div></div>
+  </div>
+  <svg id="cycleBars" viewBox="0 0 1000 50" preserveAspectRatio="none" role="img" aria-label="Candidates seen per cycle"></svg>
+  <div class="muted tiny">bars: candidates seen per cycle (green = survived to the judge)</div>
+</section>
+
+<section class="split">
+  <div class="panel analysis">
+    <div class="panel-head"><span class="title">PANDABRAIN · ANALYSIS</span><span class="right small" id="scoreType">—</span></div>
+    <div id="analysis"></div>
+  </div>
+  <div class="panel thresholds">
+    <div class="panel-head"><span class="title">thresholds.py</span><span class="right small" id="thrVersion">—</span></div>
+    <div id="thresholds"></div>
+    <div class="funnel" id="funnel"></div>
+  </div>
+</section>
+
+<section class="panel tabs-panel">
+  <nav class="tabs" role="tablist">
+    <button role="tab" class="tab active" data-tab="watch">Watchlist</button>
+    <button role="tab" class="tab" data-tab="book">Paper book</button>
+    <button role="tab" class="tab" data-tab="log">Event log</button>
+    <button role="tab" class="tab" data-tab="settings">Settings</button>
+    <button role="tab" class="tab" data-tab="health">Integrations &amp; health</button>
+  </nav>
+  <div class="tab-body" id="tab-watch">
+    <div class="toolbar">
+      <input id="wlSearch" type="search" placeholder="search symbol / address" aria-label="Search watchlist">
+      <select id="wlStatus" aria-label="Status filter"><option value="">all</option><option value="active">active</option>
+        <option value="rejected">rejected</option><option value="retired">retired</option></select>
+      <span class="muted small" id="wlCounts"></span>
+    </div>
+    <div class="table-wrap"><table class="table" id="wlTable"><thead><tr>
+      <th data-sort="symbol">Token</th><th>Chain / pool</th><th data-sort="pool_created_at">Age</th>
+      <th data-sort="price_usd">Price</th><th data-sort="liquidity_usd">Liquidity</th>
+      <th data-sort="volume_h24">Vol 24h</th><th>Buys/Sells 1h</th><th>Valuation</th><th>Gaps</th>
+      <th data-sort="last_reason">Last result</th><th data-sort="last_checked_at">Checked</th></tr></thead><tbody></tbody></table></div>
+  </div>
+  <div class="tab-body" id="tab-book" hidden></div>
+  <div class="tab-body" id="tab-log" hidden>
+    <div class="toolbar">
+      <input id="logSearch" type="search" placeholder="search events" aria-label="Search events">
+      <select id="logSeat" aria-label="Seat filter"><option value="">all seats</option></select>
+      <select id="logLevel" aria-label="Level filter"><option value="">all levels</option><option>info</option><option>warn</option><option>error</option></select>
+      <a class="btn btn-ghost small" id="exportJson" href="/api/events/export?format=json">Export JSON</a>
+      <a class="btn btn-ghost small" id="exportCsv" href="/api/events/export?format=csv">Export CSV</a>
+    </div>
+    <div class="log" id="log"></div>
+  </div>
+  <div class="tab-body" id="tab-settings" hidden></div>
+  <div class="tab-body" id="tab-health" hidden></div>
+</section>
+
+<footer class="foot">The Pandarianz · PandaBrain Desk · paper simulation only — no wallet, no signing, no real orders. Rule scores are not probabilities. Not financial advice.</footer>
+
+<aside class="drawer" id="drawer" aria-hidden="true" aria-label="Token detail">
+  <div class="drawer-head"><span id="drawerTitle" class="title">Token</span><button class="btn btn-ghost small" id="drawerClose">Close</button></div>
+  <div id="drawerBody" class="drawer-body"></div>
+</aside>
+<div class="scrim" id="scrim" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

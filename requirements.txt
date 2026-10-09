@@ -1,0 +1,2 @@
+# Runtime: Python 3.10+ standard library only. Nothing to install.
+# Optional dev tool (browser smoke test) is pinned in tests/browser/package.json + package-lock.json.
