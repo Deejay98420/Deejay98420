@@ -104,24 +104,28 @@ pub fn venue_quote(
                 c.virtual_token = vt;
                 marginal = Some(c.virtual_sol as f64 / c.virtual_token as f64);
             }
-            let fee = st.observed_curve_fee_bps.unwrap_or(fees.curve_fee_bps_default);
+            let f = st.curve_fees.unwrap_or(math::CurveFees { protocol_bps: fees.curve_fee_bps_default, creator_bps: 0 });
             let r = match side {
-                Side::Buy => math::curve_buy(c.virtual_sol, c.virtual_token, c.real_token, amount, fee),
-                Side::Sell => math::curve_sell(c.virtual_sol, c.virtual_token, c.real_sol, amount, fee),
+                Side::Buy => math::curve_buy(c.virtual_sol, c.virtual_token, c.real_token, amount, f),
+                Side::Sell => math::curve_sell(c.virtual_sol, c.virtual_token, c.real_sol, amount, f),
             };
             (Venue::PumpBondingCurve, r)
         }
         Phase::Amm => {
             let mut p = st.pool.ok_or_else(|| QuoteError::NoRoute("pool reserves unknown".into()))?;
+            let mut q_eff = p.quote_eff();
             if own_tokens > 0 && own_tokens < p.base {
-                let k = p.base as u128 * p.quote as u128;
+                let k = p.base as u128 * q_eff as u128;
                 p.base -= own_tokens;
-                p.quote = k.div_ceil(p.base as u128) as u64;
-                marginal = Some(p.quote as f64 / p.base as f64);
+                let new_eff = k.div_ceil(p.base as u128) as u64;
+                p.quote += new_eff - q_eff;
+                q_eff = new_eff;
+                marginal = Some(q_eff as f64 / p.base as f64);
             }
+            let f = p.fees.unwrap_or(math::AmmFees { lp_bps: fees.pumpswap_fee_bps, ..Default::default() });
             let r = match side {
-                Side::Buy => math::cpmm_buy(p.base, p.quote, amount, fees.pumpswap_fee_bps),
-                Side::Sell => math::cpmm_sell(p.base, p.quote, amount, fees.pumpswap_fee_bps),
+                Side::Buy => math::amm_buy(p.base, q_eff, amount, f),
+                Side::Sell => math::amm_sell(p.base, q_eff, p.quote, amount, f),
             };
             (Venue::PumpSwap, r)
         }
@@ -129,6 +133,9 @@ pub fn venue_quote(
             return Err(QuoteError::NoRoute("bonding curve complete; migration pool not yet observed".into()))
         }
     };
+    if st.quote_non_sol {
+        return Err(QuoteError::NoRoute("non-SOL quote mint (not supported for SOL-denominated paper trading)".into()));
+    }
     let r = res.ok_or_else(|| QuoteError::NoRoute(format!("{} returned zero output", venue.as_str())))?;
     let impact = marginal
         .filter(|m| *m > 0.0)

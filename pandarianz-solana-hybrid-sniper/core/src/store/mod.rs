@@ -33,6 +33,10 @@ pub struct EvaluationRecord {
     pub trigger_signature: String,
     pub trigger_slot: u64,
     pub stamps: serde_json::Value,
+    #[serde(default)]
+    pub expected_move_bps: Option<f64>,
+    #[serde(default)]
+    pub net_edge_bps: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -70,6 +74,9 @@ pub enum StoreCmd {
     Position(Box<Position>),
     PositionEvent { position_id: String, ts_us: i64, kind: String, doc: serde_json::Value },
     RouteCheck(RouteCheck),
+    ObservationGap { run_id: String, gap: crate::feed::Gap },
+    ForwardOutcome(Box<crate::forward::ForwardOutcome>),
+    ExecutionCheck(Box<crate::execcheck::ExecutionCheck>),
     /// Applied atomically (one DB transaction): e.g. a fill's ledger entries + position + order.
     Batch(Vec<StoreCmd>),
     Flush(oneshot::Sender<()>),
@@ -101,6 +108,9 @@ pub struct MemData {
     pub position_events: Vec<(String, i64, String)>,
     pub route_checks: Vec<RouteCheck>,
     pub duplicate_idempotency_rejects: u64,
+    pub gaps: Vec<crate::feed::Gap>,
+    pub forward: Vec<crate::forward::ForwardOutcome>,
+    pub exec_checks: Vec<crate::execcheck::ExecutionCheck>,
 }
 
 impl MemData {
@@ -139,6 +149,13 @@ impl MemData {
             }
             StoreCmd::PositionEvent { position_id, ts_us, kind, .. } => self.position_events.push((position_id, ts_us, kind)),
             StoreCmd::RouteCheck(r) => self.route_checks.push(r),
+            StoreCmd::ObservationGap { gap, .. } => self.gaps.push(gap),
+            StoreCmd::ForwardOutcome(f) => {
+                if !self.forward.iter().any(|x| x.eval_id == f.eval_id && x.horizon_s == f.horizon_s) {
+                    self.forward.push(*f)
+                }
+            }
+            StoreCmd::ExecutionCheck(c) => self.exec_checks.push(*c),
             StoreCmd::Batch(cmds) => {
                 for c in cmds {
                     self.apply(c, profile_key);

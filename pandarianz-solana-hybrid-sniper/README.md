@@ -1,4 +1,4 @@
-# pandarianz-solana-hybrid-sniper
+# pandarianz-solana-hybrid-sniper (v1.1)
 
 A **PAPER-ONLY** Solana memecoin launch sniper and momentum trader. It has an event-driven Rust core, PostgreSQL persistence with a replayable journal, and a read-only Next.js dashboard.
 
@@ -27,6 +27,8 @@ Other commands:
 | `start fixture --profile NAME` | Reuse a profile to resume it. Balances, positions and dedup state are recovered from PostgreSQL. |
 | `start live` | Live provider stream. Needs `SOLANA_WS_URL` in `.env`; refuses to start without it. |
 | `replay PROFILE_KEY` | Re-run a recorded journal through the current strategy as `REPLAY` data. |
+| `verify-live [SECONDS]` | Connect to your live providers, then write a validation report to `reports/`: connectivity, decode coverage, measured latency, feed health. |
+| `capture [N]` | Capture N recent real mainnet transactions per program into `fixtures/real/`, then run the real-fixture decoder checks. |
 | `logs` | Tail the engine log. |
 | `db-up` / `db-down` | Start or stop the Docker PostgreSQL. |
 
@@ -64,19 +66,56 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the modules and [docs/ASSUM
 11. **Safety.** Static source and dependency scans, GET-only API checks, and a `.env.example` placeholder check.
 12. **Tooling.** `scripts/sniper` (bash 3.2 compatible), `.env.example` with placeholders, and `docker-compose.yml` for PostgreSQL.
 
+## Going live (data only, PAPER trading)
+
+See **[docs/LIVE.md](docs/LIVE.md)** for the exact Mac Terminal steps. In short: put provider URLs in `.env` (`SOLANA_WS_URLS`, optionally `SOLANA_RPC_URLS` and `JUPITER_QUOTE_URL`), then run `./scripts/sniper verify-live 120`, `./scripts/sniper capture 25`, and `./scripts/sniper start live`.
+
+What V1.1 adds for live operation:
+
+- **Multiple providers at once**, deduplicated, with failover. The feed state machine is HEALTHY / DEGRADED / DOWN, driven by provider connection state, event silence, chain-tip freshness (`slotSubscribe`) and slot lag. Entries are blocked unless the feed is HEALTHY, and every unhealthy interval is persisted as an observation gap.
+- **PumpSwap events with a logs-only provider.** Logs that invoke PumpSwap are routed to a bounded-concurrency `getTransaction` fetcher (fetch latency is measured). Alternatively, `SOLANA_STREAM_KIND=transactions` uses `transactionSubscribe`.
+- **Startup backfill.** Recent history comes from `getSignaturesForAddress` + `getTransaction`. It updates state only and never triggers a trade, so tokens launched before startup can still be evaluated.
+- **Pool discovery.** Pool accounts are fetched via `getAccountInfo` and decoded against the IDL. **Mint checks** cover freeze authority and risky Token-2022 extensions (transfer hook, permanent delegate, non-transferable, transfer fee, pausable, default-frozen).
+- **Live executable quote observations.** Jupiter quotes are attached to pending orders. The fill basis is `conservative`, i.e. min(venue simulation, fresh aggregator quote). There are no fills on stale state.
+- **Execution evidence.** Each simulated fill is compared with the next real same-side market trade.
+- **Forward evaluation.** Accepted and rejected candidates are re-quoted at 30 s / 120 s / 300 s and written as immutable records. Decisions never read them; a test proves this.
+
 ## Data modes
 
 | Mode | Source | Shown as |
 |---|---|---|
-| `FIXTURE` | `fixtures/hybrid_session.jsonl`, generated deterministically by `sniper gen-fixtures`. Synthetic events encoded with the venue byte layouts and a reserve-consistent curve/pool simulation. | Amber `FIXTURE DATA` badge and a "NOT market data" banner |
+| `FIXTURE` | `fixtures/synthetic/hybrid_session.jsonl`, generated deterministically by `sniper gen-fixtures`. Synthetic events encoded with the venue byte layouts and a reserve-consistent curve/pool simulation. | Amber `FIXTURE DATA` badge and a "NOT market data" banner |
 | `LIVE` | Your provider's WebSocket (`SOLANA_WS_URL`) | Green `LIVE DATA` badge; trades are still PAPER |
 | `REPLAY` | A profile's PostgreSQL journal | Blue `REPLAY DATA` badge |
 
 Labels cannot be crossed: the fixture loader relabels everything as FIXTURE, a live engine rejects non-live events, and a non-live engine rejects live-labelled events.
 
+## Decoder verification status
+
+| Venue / item | Status | Evidence |
+|---|---|---|
+| Pump.fun Create/Trade/Complete/Migration events, BondingCurve account | **IDL-verified** | Official IDL from `@pump-fun/pump-sdk@4.0.0` (`fixtures/idl/`). A generic IDL-driven encoder is checked against our decoders in `tests/idl_verification.rs`. Curve math is ported from the SDK's `bondingCurve.ts` / `fees.ts`. |
+| PumpSwap CreatePool/Buy/Sell/Deposit/Withdraw events, Pool account | **IDL-verified** | Official IDL from `@pump-fun/pump-swap-sdk@2.1.0`. AMM math (with `virtual_quote_reserves` and per-component fees) is ported from the SDK's `buy.ts` / `sell.ts`. |
+| Raydium AMM v4 `ray_log` | **unverified**, decode-only | Never traded. |
+| Captured mainnet transactions | **pending** | No RPC access from the build environment. `sniper capture` and `tests/real_fixtures.rs` are ready; the harness is self-tested. |
+
+The IDL check found and fixed real issues relative to v1.0:
+
+- Pump.fun curves can be quoted in **non-SOL mints**. These are now detected and never traded.
+- Fees now include creator / coin-creator components, ceil-rounded per component, taken from each event.
+- PumpSwap pricing now uses `vault + virtual_quote_reserves`.
+- Sells that exceed the pool's real reserves have no route.
+
 ## Tests
 
-`./scripts/sniper test` runs:
+`./scripts/sniper test` runs 87 tests, plus the static check and the dashboard typecheck/build:
+
+- `idl_verification` (8): decoders vs. the official IDLs, including full new tails, the signed i128 offset, and account discriminators.
+- `live_pipeline` (1): full LIVE mode against local mock providers. Covers dead-provider failover, chain tip, logs → `getTransaction` PumpSwap fetch, startup backfill, pool discovery, mint checks, a read-only RPC method audit, and the feed reaching HEALTHY.
+- `live_engine` (9): entries blocked while the feed is unhealthy, gap persisted; mint-safety gating; backfill never trades; out-of-order guard; non-SOL quotes rejected; virtual-reserve pricing; conservative fill and stale-state refusal; execution checks; forward evaluation with a no-future-information proof.
+- `real_fixtures` (2): real mainnet captures (currently none, reported explicitly), plus a self-test of the invariant harness.
+- Feed state machine (4) and mint-safety unit tests (3); SDK-formula math tests.
+- The v1.0 suites described below.
 
 - `decode` (12): round-trips per venue; legacy/short layouts; invoke-stack attribution (a router's own `Program data` is ignored); garbage/truncation → warnings; WS `logsNotification` / `transactionNotification` parsing; URL key redaction; fixture-never-live.
 - `stream` (7): dedup window / upgrades / eviction; multi-provider duplicates; bounded queue backpressure with no loss and order kept; backoff; **real reconnection** against a local WebSocket server (close and idle timeout); reconnect exhaustion; journaled rollback markers.
@@ -93,9 +132,8 @@ Labels cannot be crossed: the fixture loader relabels everything as FIXTURE, a l
 
 **Not verified / blocked:**
 
-- **LIVE mainnet streaming has not been run.** No provider credentials were available, and the build container's network policy blocks Solana RPC and Jupiter hosts. The WebSocket client is tested only against a local server. The first live run is the real test of message shapes and throughput.
-- **Fixture byte layouts come from public IDLs and were not checked against captured mainnet transactions.** Only the Pump.fun `TradeEvent` discriminator is checked against a published value. Capture real transactions and add them as fixtures before trusting live decoding.
-- **PumpSwap events are invisible to plain `logsSubscribe`.** They are emitted via `emit_cpi`, so live PumpSwap tracking needs `SOLANA_STREAM_KIND=transactions` (a provider supporting `transactionSubscribe`). PumpSwap swaps on pools whose creation or migration was not observed are counted as `unresolved_pool_events`; RPC pool-account lookup is not implemented.
+- **LIVE mainnet streaming has NOT been run.** No provider credentials were available, and the build container's egress policy blocks Solana RPC and Jupiter. Every live adapter is tested end-to-end against local mock providers that use the real RPC JSON shapes. Mainnet validation is the first `verify-live` run on your machine.
+- **No decoder has been checked against a captured mainnet transaction yet.** They are checked against the official IDLs and SDK math (strong, but not the same thing). Run `capture` first.
 - **Raydium v4 is decode-only.** `ray_log` has no pool or mint ids.
 - **Docker Compose was not exercised here** (no Docker daemon in the container). The same scripts were run against a local PostgreSQL 16.
 - **Latency figures** come from this machine on fixture data. The provider-lag and queue-wait series only fill in LIVE mode.

@@ -1,5 +1,7 @@
 # Strategy / cost overrides (all optional; defaults are in core/src/config.rs).
 # Any change here changes the strategy_version stamped on every record.
+fill_basis = "conservative"        # min(venue simulation, fresh live Jupiter quote)
+exec_check_window_s = 5.0
 [strategy]
 label = "hybrid"
 
@@ -9,6 +11,12 @@ size_score_thresholds = [0.0, 0.62, 0.80]
 max_entry_impact_bps = 350.0
 max_round_trip_cost_bps = 900.0
 max_size_fraction_of_liquidity = 0.03
+require_mint_check = true          # live: block entries until the mint passes freeze/Token-2022 checks
+max_fill_state_age_ms = 15000.0    # never simulate a fill on older state
+expected_move_scale_bps = 2500.0   # UNCALIBRATED heuristic prior — calibrate from forward evaluation
+min_net_edge_bps = 150.0           # expected move − estimated round-trip cost
+min_liquidity_stability = 0.75
+block_entries_when_feed_unhealthy = true
 
 [strategy.exit]
 # dynamic, volatility-scaled trailing width — no fixed take-profit
@@ -16,6 +24,8 @@ trail_vol_mult = 3.0
 min_trail = 0.10
 max_trail = 0.35
 max_hold_s = 900.0
+fade_buy_ratio_10s = 0.40          # lock any net profit once short-term flow turns
+max_exit_impact_bps = 1500.0       # sellability concern
 
 [risk]
 starting_balance_lamports = 1000000000
@@ -25,3 +35,15 @@ max_exposure_lamports = 250000000
 [costs]
 curve_fee_bps_default = 125   # used only when trade events do not report fees
 pumpswap_fee_bps = 30
+
+
+[feed_health]
+stale_event_ms = 20000.0
+down_event_ms = 60000.0
+stale_tip_ms = 5000.0
+max_slot_lag = 150
+
+[forward]
+enabled = true
+probe_lamports = 50000000
+horizons_s = [30, 120, 300]

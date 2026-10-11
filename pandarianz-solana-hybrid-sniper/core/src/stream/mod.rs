@@ -41,6 +41,12 @@ pub struct RawEvent {
     pub block_time: Option<i64>,
     /// When this process received the message (µs). For fixtures this is the scripted timeline.
     pub recv_us: i64,
+    /// Historical transaction loaded by startup backfill: updates state only, never triggers trades.
+    #[serde(default)]
+    pub backfill: bool,
+    /// µs spent fetching the full transaction after its signature was first seen (logs → getTransaction).
+    #[serde(default)]
+    pub fetch_us: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +74,8 @@ pub enum StreamMsg {
     Event(RawEvent),
     Slot { slot: u64, status: SlotStatus, recv_us: i64 },
     Connection { provider: String, state: ConnState, detail: String, recv_us: i64 },
+    /// Chain tip observed by a provider (slotSubscribe): used for slot lag and feed liveness.
+    Tip { provider: String, slot: u64, recv_us: i64 },
     /// End of a finite source (fixture file).
     End { provider: String, recv_us: i64 },
 }
@@ -89,6 +97,8 @@ impl RawEvent {
             inner_ix: vec![],
             block_time: None,
             recv_us,
+            backfill: false,
+            fetch_us: None,
         }
     }
     pub fn is_slot_marker(&self) -> bool {
@@ -108,7 +118,10 @@ impl StreamMsg {
     pub fn recv_us(&self) -> i64 {
         match self {
             StreamMsg::Event(e) => e.recv_us,
-            StreamMsg::Slot { recv_us, .. } | StreamMsg::Connection { recv_us, .. } | StreamMsg::End { recv_us, .. } => *recv_us,
+            StreamMsg::Slot { recv_us, .. }
+            | StreamMsg::Connection { recv_us, .. }
+            | StreamMsg::End { recv_us, .. }
+            | StreamMsg::Tip { recv_us, .. } => *recv_us,
         }
     }
 }

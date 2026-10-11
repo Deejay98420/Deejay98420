@@ -78,6 +78,8 @@ impl Timeline {
             inner_ix: inner,
             block_time: Some(t_us / 1_000_000),
             recv_us: t_us,
+            backfill: false,
+            fetch_us: None,
         }));
         s
     }
@@ -108,6 +110,10 @@ pub struct Curve {
 }
 
 impl Curve {
+    /// Fee split used by the synthetic curve (95 bps protocol + 5 bps creator), reported in events.
+    pub fn fees(&self) -> math::CurveFees {
+        math::CurveFees { protocol_bps: 95, creator_bps: self.fee_bps - 95 }
+    }
     pub fn new(label: &str) -> Self {
         Self {
             mint: Pubkey::synthetic(&format!("mint:{label}")),
@@ -135,6 +141,16 @@ impl Curve {
             virtual_sol_reserves: Some(self.vs),
             real_token_reserves: Some(self.rt),
             token_total_supply: Some(1_000_000_000_000_000),
+            tail: Some(crate::decode::pumpfun::CreateTail {
+                token_program: Pubkey::synthetic("spl-token"),
+                is_mayhem_mode: false,
+                is_cashback_enabled: false,
+                quote_mint: Pubkey::default(),
+                virtual_quote_reserves: self.vs,
+                creator_fee_bps: 5,
+                is_holder_reward: false,
+                depth: 0,
+            }),
         })
     }
     fn trade_ev(&self, user: Pubkey, sol: u64, tokens: u64, is_buy: bool, fee: u64, t_us: i64) -> PumpEvent {
@@ -155,6 +171,27 @@ impl Curve {
             creator: Some(self.creator),
             creator_fee_basis_points: Some(5),
             creator_fee: Some(0),
+            tail: Some(crate::decode::pumpfun::TradeTail {
+                track_volume: true,
+                total_unclaimed_tokens: 0,
+                total_claimed_tokens: 0,
+                current_sol_volume: 0,
+                last_update_timestamp: t_us / 1_000_000,
+                ix_name: if is_buy { "buy".into() } else { "sell".into() },
+                mayhem_mode: false,
+                cashback_fee_basis_points: 0,
+                cashback: 0,
+                buyback_fee_basis_points: 0,
+                buyback_fee: 0,
+                shareholders: vec![],
+                quote_mint: Pubkey::default(),
+                quote_amount: sol,
+                virtual_quote_reserves: self.vs,
+                real_quote_reserves: self.rs,
+                holder_rewards_bps: 0,
+                holder_rewards: 0,
+                creator_fee_unclaimed: 0,
+            }),
         })
     }
     /// Buy with total spend (lamports). Returns None if the curve is complete.
@@ -162,7 +199,7 @@ impl Curve {
         if self.complete {
             return None;
         }
-        let r = math::curve_buy(self.vs, self.vt, self.rt, spend, self.fee_bps)?;
+        let r = math::curve_buy(self.vs, self.vt, self.rt, spend, self.fees())?;
         let net = r.amount_in - r.fee;
         self.vs += net;
         self.vt -= r.amount_out;
@@ -177,7 +214,7 @@ impl Curve {
         if self.complete {
             return None;
         }
-        let r = math::curve_sell(self.vs, self.vt, self.rs, tokens, self.fee_bps)?;
+        let r = math::curve_sell(self.vs, self.vt, self.rs, tokens, self.fees())?;
         let gross = r.amount_out + r.fee;
         self.vs -= gross;
         self.vt += tokens;
@@ -186,7 +223,7 @@ impl Curve {
         Some(self.trade_ev(user, r.amount_out, tokens, false, r.fee, t_us))
     }
     pub fn complete_ev(&self, t_us: i64) -> PumpEvent {
-        PumpEvent::Complete(PumpComplete { user: wallet("completer"), mint: self.mint, bonding_curve: self.bonding_curve, timestamp: t_us / 1_000_000 })
+        PumpEvent::Complete(PumpComplete { user: wallet("completer"), mint: self.mint, bonding_curve: self.bonding_curve, timestamp: t_us / 1_000_000, quote_mint: Some(Pubkey::default()) })
     }
 }
 
@@ -199,11 +236,22 @@ pub struct Pool {
     pub quote: u64,
     pub lp_bps: u64,
     pub protocol_bps: u64,
+    pub creator_bps: u64,
+    pub coin_creator: Pubkey,
 }
 
 impl Pool {
     pub fn new(label: &str, mint: Pubkey, base: u64, quote: u64) -> Self {
-        Self { pool: Pubkey::synthetic(&format!("pool:{label}")), mint, base, quote, lp_bps: 20, protocol_bps: 5 }
+        Self {
+            pool: Pubkey::synthetic(&format!("pool:{label}")),
+            mint,
+            base,
+            quote,
+            lp_bps: 20,
+            protocol_bps: 5,
+            creator_bps: 5,
+            coin_creator: Pubkey::synthetic(&format!("coin-creator:{label}")),
+        }
     }
     pub fn create_ev(&self, creator: Pubkey, t_us: i64) -> PumpSwapEvent {
         PumpSwapEvent::CreatePool(CreatePool {
@@ -224,51 +272,57 @@ impl Pool {
             pool_bump: 255,
             pool: self.pool,
             lp_mint: Pubkey::synthetic("lp-mint"),
+            coin_creator: Some(self.coin_creator),
+            creator_fee_bps: Some(self.creator_bps),
         })
     }
-    pub fn buy(&mut self, user: Pubkey, spend: u64, t_us: i64) -> PumpSwapEvent {
-        let total = self.lp_bps + self.protocol_bps;
-        let net = (spend as u128 * 10_000 / (10_000 + total as u128)) as u64;
-        let lp_fee = net * self.lp_bps / 10_000;
-        let protocol_fee = spend - net - lp_fee;
-        let out = (self.base as u128 * net as u128 / (self.quote as u128 + net as u128)) as u64;
-        let ev = Swap {
-            is_buy: true,
+    fn fee(amount: u64, bps: u64) -> u64 {
+        ((amount as u128 * bps as u128).div_ceil(10_000)) as u64
+    }
+    fn swap_ev(&self, is_buy: bool, t_us: i64, base_amount: u64, user_quote: u64, pool_quote: u64, lp: u64, proto: u64, creator: u64, user: Pubkey) -> PumpSwapEvent {
+        PumpSwapEvent::Swap(Swap {
+            is_buy,
             timestamp: t_us / 1_000_000,
-            base_amount: out,
-            quote_amount_user: spend,
+            base_amount,
+            quote_amount_user: user_quote,
             pool_base_token_reserves: self.base,
             pool_quote_token_reserves: self.quote,
-            quote_amount_pool: net + lp_fee,
-            lp_fee,
-            protocol_fee,
+            quote_amount_pool: pool_quote,
+            lp_fee: lp,
+            protocol_fee: proto,
             pool: self.pool,
             user,
-        };
-        self.base -= out;
-        self.quote += net + lp_fee;
-        PumpSwapEvent::Swap(ev)
+            lp_fee_bps: self.lp_bps,
+            protocol_fee_bps: self.protocol_bps,
+            coin_creator: Some(self.coin_creator),
+            coin_creator_fee_bps: Some(self.creator_bps),
+            coin_creator_fee: Some(creator),
+            virtual_quote_reserves: Some(0),
+        })
     }
+    /// Exact-quote-in buy following the pump-swap SDK (`buyQuoteInput`).
+    pub fn buy(&mut self, user: Pubkey, spend: u64, t_us: i64) -> PumpSwapEvent {
+        let total = self.lp_bps + self.protocol_bps + self.creator_bps;
+        let mut net = (spend as u128 * 10_000 / (10_000 + total as u128)) as u64;
+        let (lp, proto, cr) = (Self::fee(net, self.lp_bps), Self::fee(net, self.protocol_bps), Self::fee(net, self.creator_bps));
+        if net + lp + proto + cr > spend {
+            net -= net + lp + proto + cr - spend;
+        }
+        let input = net - 1;
+        let out = (self.base as u128 * input as u128 / (self.quote as u128 + input as u128)) as u64;
+        let ev = self.swap_ev(true, t_us, out, spend, net + lp, lp, proto, cr, user);
+        self.base -= out;
+        self.quote += net + lp;
+        ev
+    }
+    /// Sell following the pump-swap SDK (`sellBaseInput`).
     pub fn sell(&mut self, user: Pubkey, tokens: u64, t_us: i64) -> PumpSwapEvent {
         let gross = (self.quote as u128 * tokens as u128 / (self.base as u128 + tokens as u128)) as u64;
-        let lp_fee = gross * self.lp_bps / 10_000;
-        let protocol_fee = gross * self.protocol_bps / 10_000;
-        let ev = Swap {
-            is_buy: false,
-            timestamp: t_us / 1_000_000,
-            base_amount: tokens,
-            quote_amount_user: gross - lp_fee - protocol_fee,
-            pool_base_token_reserves: self.base,
-            pool_quote_token_reserves: self.quote,
-            quote_amount_pool: gross - lp_fee,
-            lp_fee,
-            protocol_fee,
-            pool: self.pool,
-            user,
-        };
+        let (lp, proto, cr) = (Self::fee(gross, self.lp_bps), Self::fee(gross, self.protocol_bps), Self::fee(gross, self.creator_bps));
+        let ev = self.swap_ev(false, t_us, tokens, gross - lp - proto - cr, gross - lp, lp, proto, cr, user);
         self.base += tokens;
-        self.quote -= gross - lp_fee;
-        PumpSwapEvent::Swap(ev)
+        self.quote -= gross - lp;
+        ev
     }
     pub fn withdraw(&mut self, user: Pubkey, fraction: f64, t_us: i64) -> PumpSwapEvent {
         let b = (self.base as f64 * fraction) as u64;
@@ -451,6 +505,7 @@ pub fn scenario_migration(tl: &mut Timeline, start: i64, label: &str, seed: u64)
         bonding_curve: c.bonding_curve,
         timestamp: t / 1_000_000,
         pool: pool.pool,
+        quote_mint: Some(Pubkey::default()),
     });
     tl.pump(t, vec![migr]);
     t += 400_000;

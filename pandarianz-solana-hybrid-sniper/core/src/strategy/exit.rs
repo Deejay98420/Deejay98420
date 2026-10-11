@@ -23,6 +23,8 @@ pub enum ExitReason {
     LiquidityWithdrawal { drop_fraction: f64 },
     RugWarning { detail: String },
     Stagnation { secs_since_peak: f64 },
+    MomentumFadeInProfit { pnl_fraction: f64, buy_ratio_10s: f64, net_flow_sol_10s: f64 },
+    SellabilityConcern { exit_impact_bps: f64, max_bps: f64 },
     MaxHold { held_s: f64 },
     RouteLost { detail: String },
 }
@@ -44,6 +46,8 @@ pub struct PositionView {
     pub peak_us: i64,
     pub entry_liquidity_lamports: u64,
     pub entry_creator_sold_fraction: f64,
+    /// price impact of the full-position exit quote, bps
+    pub exit_impact_bps: Option<f64>,
 }
 
 pub fn dynamic_width(vol: f64, mult: f64, lo: f64, hi: f64) -> f64 {
@@ -80,6 +84,11 @@ pub fn exit_signal(f: &Features, pv: &PositionView, value: Option<u64>, cfg: &Ex
     let Some(value) = value else {
         return Some((ExitReason::RouteLost { detail: "no executable exit quote".into() }, Urgency::Normal));
     };
+    if let Some(imp) = pv.exit_impact_bps.filter(|i| i.is_finite()) {
+        if imp > cfg.max_exit_impact_bps {
+            return Some((ExitReason::SellabilityConcern { exit_impact_bps: imp, max_bps: cfg.max_exit_impact_bps }, Urgency::Normal));
+        }
+    }
     let pnl = value as f64 / pv.cost_basis_lamports.max(1) as f64 - 1.0;
     let stop = dynamic_width(f.volatility_60s, cfg.stop_vol_mult, cfg.min_stop, cfg.max_stop);
     if pnl <= -stop {
@@ -90,6 +99,13 @@ pub fn exit_signal(f: &Features, pv: &PositionView, value: Option<u64>, cfg: &Ex
         if (value as f64) < pv.peak_value_lamports as f64 * (1.0 - width) {
             return Some((ExitReason::TrailingStop { peak_value: pv.peak_value_lamports, value, width }, Urgency::Normal));
         }
+    }
+    // Any net profit after costs is worth keeping once short-term flow turns against us.
+    if pnl > 0.0 && (f.w10.buys + f.w10.sells) >= 3 && f.w10.buy_ratio() < cfg.fade_buy_ratio_10s && f.w10.net_flow_lamports() < 0 {
+        return Some((
+            ExitReason::MomentumFadeInProfit { pnl_fraction: pnl, buy_ratio_10s: f.w10.buy_ratio(), net_flow_sol_10s: sol(f.w10.net_flow_lamports()) },
+            Urgency::Normal,
+        ));
     }
     let br = f.w30.buy_ratio();
     let nf = sol(f.w30.net_flow_lamports());

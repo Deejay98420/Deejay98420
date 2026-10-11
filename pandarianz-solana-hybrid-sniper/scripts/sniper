@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # One-command local workflow (macOS / Linux, bash 3.2 compatible). PAPER ONLY.
-#   ./scripts/sniper setup | start [fixture|live] [--profile NAME] | stop [--db] | status | test | report [PROFILE_KEY] | replay PROFILE_KEY | logs | db-up | db-down
+#   ./scripts/sniper setup | start [fixture|live] [--profile NAME] | stop [--db] | status | test | report [PROFILE_KEY]
+#                    | replay PROFILE_KEY | verify-live [SECONDS] | capture [N] | logs | db-up | db-down
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN="$ROOT/.run"
@@ -46,7 +47,7 @@ dash_deps() {
 cmd_setup() {
   [ -f "$ROOT/.env" ] || { cp "$ROOT/.env.example" "$ROOT/.env"; say "created .env from .env.example (placeholders only)"; }
   build; dash_deps
-  (cd "$CORE" && "$BIN" gen-fixtures --out "$ROOT/fixtures")
+  (cd "$CORE" && "$BIN" gen-fixtures --out "$ROOT/fixtures/synthetic")
   db_up
   (cd "$CORE" && "$BIN" migrate)
   say "setup complete. Next: ./scripts/sniper start"
@@ -73,16 +74,17 @@ cmd_start() {
     shift
   done
   alive "$RUN/engine.pid" && die "engine already running (pid $(cat "$RUN/engine.pid")); use ./scripts/sniper stop"
-  if [ "$mode" = "live" ] && [ -z "${SOLANA_WS_URL:-}" ]; then
-    die "LIVE mode needs SOLANA_WS_URL in .env (provider WebSocket). Use 'start fixture' for the offline replay."
+  if [ "$mode" = "live" ] && [ -z "${SOLANA_WS_URLS:-}${SOLANA_WS_URL:-}" ]; then
+    die "LIVE mode needs SOLANA_WS_URLS in .env (provider WebSocket URL[s]). Use 'start fixture' for the offline replay."
   fi
+  case "${SOLANA_WS_URLS:-}" in *"<"*) [ "$mode" = live ] && die "SOLANA_WS_URLS still contains the .env.example placeholder" ;; esac
   [ -x "$BIN" ] || build
   db_up
   [ -n "$profile" ] || profile="$( [ "$mode" = live ] && echo main || echo "run$(date +%s)")"
   local key; key="$( [ "$mode" = live ] && echo "LIVE:$profile" || echo "FIXTURE:$profile")"
   echo "$key" > "$RUN/profile"
   local fx=()
-  [ "$mode" = fixture ] && [ -f "$ROOT/fixtures/hybrid_session.jsonl" ] && fx=(--fixture "$ROOT/fixtures/hybrid_session.jsonl")
+  [ "$mode" = fixture ] && [ -f "$ROOT/fixtures/synthetic/hybrid_session.jsonl" ] && fx=(--fixture "$ROOT/fixtures/synthetic/hybrid_session.jsonl")
   say "starting engine: mode=$mode profile=$key api=$SNIPER_API_ADDR (PAPER ONLY)"
   launch engine "$CORE" "$BIN" run --mode "$mode" --profile "$profile" --hold ${fx[@]+"${fx[@]}"}
   dash_deps
@@ -156,6 +158,20 @@ cmd_replay() {
   (cd "$CORE" && "$BIN" replay --from-profile "$1")
 }
 
+cmd_verify_live() {
+  [ -n "${SOLANA_WS_URLS:-}${SOLANA_WS_URL:-}" ] || die "verify-live needs SOLANA_WS_URLS in .env"
+  [ -x "$BIN" ] || build
+  local secs="${1:-120}"
+  say "connecting to live providers for ${secs}s (read-only, memory store) …"
+  (cd "$CORE" && "$BIN" verify-live --seconds "$secs" --out "$ROOT/reports")
+}
+
+cmd_capture() {
+  [ -x "$BIN" ] || build
+  (cd "$CORE" && "$BIN" capture --from-live "${1:-25}" --out "$ROOT/fixtures/real")
+  (cd "$CORE" && cargo test --quiet --test real_fixtures -- --nocapture 2>&1 | grep -E "FIXTURES|test result")
+}
+
 case "${1:-help}" in
   setup) cmd_setup ;;
   start) shift; cmd_start "$@" ;;
@@ -164,6 +180,8 @@ case "${1:-help}" in
   test) cmd_test ;;
   report) shift; cmd_report "$@" ;;
   replay) shift; cmd_replay "$@" ;;
+  verify-live) shift; cmd_verify_live "$@" ;;
+  capture) shift; cmd_capture "$@" ;;
   logs) tail -n 100 -f "$RUN/engine.log" ;;
   db-up) db_up ;;
   db-down) (cd "$ROOT" && docker compose stop postgres) ;;

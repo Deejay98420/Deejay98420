@@ -208,7 +208,7 @@ fn discovered_token_uses_momentum_path() {
 }
 
 fn pv(cost: u64, peak: u64, peak_us: i64, liq: u64) -> PositionView {
-    PositionView { opened_us: 0, cost_basis_lamports: cost, peak_value_lamports: peak, peak_us, entry_liquidity_lamports: liq, entry_creator_sold_fraction: 0.0 }
+    PositionView { opened_us: 0, cost_basis_lamports: cost, peak_value_lamports: peak, peak_us, entry_liquidity_lamports: liq, entry_creator_sold_fraction: 0.0, exit_impact_bps: None }
 }
 
 #[test]

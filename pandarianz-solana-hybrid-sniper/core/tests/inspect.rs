@@ -28,3 +28,20 @@ async fn inspect_fixture_trades() {
         println!("ORDER {:?} {:?} {} amt {} min_out {} fill {:?} err {:?}", o.kind, o.status, &o.mint.to_string()[..6], o.amount, o.min_out, o.fill.as_ref().map(|f| (f.out_amount, f.latency_ms)), o.error);
     }
 }
+
+#[tokio::test]
+#[ignore]
+async fn inspect_rejections() {
+    let data = Arc::new(Mutex::new(MemData::default()));
+    let mut e = common::engine_with(EngineConfig::default(), data.clone(), "insp2");
+    e.boot(serde_json::json!({})).await;
+    common::feed(&mut e, sniper_core::fixtures::hybrid_session()).await;
+    let s = e.snapshot();
+    let mut rc: Vec<_> = s.rejection_counts.iter().collect();
+    rc.sort_by_key(|(_, v)| std::cmp::Reverse(**v));
+    println!("{rc:?}");
+    let d = data.lock().unwrap();
+    for ev in d.evaluations.iter().filter(|e| e.reasons.as_array().map(|a| a.len() <= 2).unwrap_or(false)) {
+        println!("{} {} {} score {:.2} edge {:?} exp {:?} reasons {}", ev.symbol.clone().unwrap_or_default(), ev.path, ev.decision, ev.score, ev.net_edge_bps, ev.expected_move_bps, ev.reasons);
+    }
+}

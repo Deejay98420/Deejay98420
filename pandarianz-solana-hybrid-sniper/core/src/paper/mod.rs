@@ -105,6 +105,15 @@ pub struct Order {
     pub costs: CostBreakdown,
     pub error: Option<String>,
     pub completed_us: Option<i64>,
+    /// live executable aggregator quote observed for this order while it was pending (Jupiter)
+    #[serde(default)]
+    pub observed_quote: Option<Quote>,
+    /// how the fill amount was determined: venue_sim | conservative:aggregator | conservative:venue_sim | aggregator_quote
+    #[serde(default)]
+    pub fill_basis: Option<String>,
+    /// (venue simulation out − aggregator out) / aggregator out, bps
+    #[serde(default)]
+    pub aggregator_divergence_bps: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,6 +339,21 @@ pub enum FillOutcome {
 
 /// Attempt to fill a pending order at `now_us` against `st` (state at fill time).
 /// Mutates `order` and `book` (ledger). Returns ledger entries produced.
+/// How simulated fills use live aggregator observations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FillBasisMode {
+    /// venue-local simulation only
+    VenueSim,
+    /// min(venue simulation, fresh aggregator quote) — never better than either source
+    Conservative,
+}
+
+impl FillBasisMode {
+    pub fn parse(s: &str) -> Self {
+        if s == "venue_sim" { FillBasisMode::VenueSim } else { FillBasisMode::Conservative }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn fill_order(
     order: &mut Order,
@@ -338,7 +362,22 @@ pub fn fill_order(
     fees: &VenueFees,
     costs: &CostConfig,
     exit_cfg: &ExitPolicy,
-    max_state_age_ms: f64,
+    max_fill_state_age_ms: f64,
+    now_us: i64,
+) -> (FillOutcome, Vec<LedgerEntry>) {
+    fill_order_with(order, st, book, fees, costs, exit_cfg, max_fill_state_age_ms, FillBasisMode::Conservative, now_us)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn fill_order_with(
+    order: &mut Order,
+    st: Option<&TokenState>,
+    book: &mut Book,
+    fees: &VenueFees,
+    costs: &CostConfig,
+    exit_cfg: &ExitPolicy,
+    max_fill_state_age_ms: f64,
+    basis: FillBasisMode,
     now_us: i64,
 ) -> (FillOutcome, Vec<LedgerEntry>) {
     let scen = book.scenario.clone();
@@ -350,8 +389,8 @@ pub fn fill_order(
     };
     let q: Result<Quote, QuoteError> = match st {
         None => Err(QuoteError::NoRoute("token state not available".into())),
-        // At fill time we accept older state than at decision time: the fill is what it is.
-        Some(s) => venue_quote(s, order.side, order.amount, own, fees, max_state_age_ms.max(60_000.0), now_us),
+        // No fill against stale state: an executable price cannot be known.
+        Some(s) => venue_quote(s, order.side, order.amount, own, fees, max_fill_state_age_ms, now_us),
     };
     if order.kind == OrderKind::Entry {
         book.reserved = book.reserved.saturating_sub(entry_reservation(order.amount, &scen, costs));
@@ -362,6 +401,7 @@ pub fn fill_order(
         (Err(QuoteError::NoRoute(_)), Some(dq))
             if dq.source == crate::quote::QuoteSource::Jupiter && now_us - dq.quoted_at_us <= 5_000_000 =>
         {
+            order.fill_basis = Some("aggregator_quote".into());
             Ok(dq.clone())
         }
         (q, _) => q,
@@ -374,6 +414,25 @@ pub fn fill_order(
             return (FillOutcome::Failed { retryable: true }, ledger);
         }
     };
+    let mut q = q;
+    if order.fill_basis.is_none() {
+        order.fill_basis = Some("venue_sim".into());
+        if let Some(oq) = order.observed_quote.as_ref().filter(|oq| (now_us - oq.quoted_at_us).abs() <= 5_000_000 && oq.in_amount > 0) {
+            // compare like for like: scale the aggregator quote to our input amount
+            let agg_out = (oq.out_amount as u128 * q.in_amount.max(1) as u128 / oq.in_amount as u128) as u64;
+            if agg_out > 0 {
+                order.aggregator_divergence_bps = Some((q.out_amount as f64 / agg_out as f64 - 1.0) * 10_000.0);
+            }
+            if basis == FillBasisMode::Conservative {
+                if agg_out < q.out_amount {
+                    q.out_amount = agg_out;
+                    order.fill_basis = Some("conservative:aggregator".into());
+                } else {
+                    order.fill_basis = Some("conservative:venue_sim".into());
+                }
+            }
+        }
+    }
     order.fill_quote = Some(q.clone());
     if det_unit(&format!("{}:drop", sim_seed(&book.id, &scen.name, &order.order_id))) < scen.drop_probability {
         order.status = OrderStatus::Dropped;
@@ -401,7 +460,9 @@ pub fn fill_order(
         return (FillOutcome::Failed { retryable: true }, ledger);
     }
     order.status = OrderStatus::Filled;
-    order.fill = Some(Fill { in_amount: order.amount, out_amount: out, latency_ms, quote_age_ms: q.state_age_ms });
+    // buys: the venue charges what the tokens cost (≤ the budget), as the on-chain program does
+    let charged = if order.kind == OrderKind::Entry { q.in_amount.min(order.amount) } else { order.amount };
+    order.fill = Some(Fill { in_amount: charged, out_amount: out, latency_ms, quote_age_ms: q.state_age_ms });
     order.costs.base_fee = costs.base_fee_lamports;
     order.costs.priority_fee = scen.priority_fee_lamports;
     order.costs.tip = scen.tip_lamports;
@@ -410,13 +471,13 @@ pub fn fill_order(
             if order.side == Side::Buy {
                 // buy-side adverse slippage = fewer tokens; value it at the fill price for the record
                 order.costs.adverse_slippage_lamports = if q.out_amount > 0 {
-                    (adverse as f64 * order.amount as f64 / q.out_amount as f64) as i64
+                    (adverse as f64 * charged as f64 / q.out_amount as f64) as i64
                 } else {
                     0
                 };
             }
             order.costs.ata_rent_deposit = costs.ata_rent_lamports;
-            ledger.push(book.post(now_us, LedgerKind::EntrySpend, -(order.amount as i64), &order.order_id));
+            ledger.push(book.post(now_us, LedgerKind::EntrySpend, -(charged as i64), &order.order_id));
             ledger.push(book.post(now_us, LedgerKind::TxFee, -((costs.base_fee_lamports + scen.priority_fee_lamports) as i64), &order.order_id));
             if scen.tip_lamports > 0 {
                 ledger.push(book.post(now_us, LedgerKind::Tip, -(scen.tip_lamports as i64), &order.order_id));
@@ -424,7 +485,7 @@ pub fn fill_order(
             ledger.push(book.post(now_us, LedgerKind::RentDeposit, -(costs.ata_rent_lamports as i64), &order.order_id));
             let st = st.expect("filled implies state");
             let pid = format!("pos-{}", order.order_id.trim_start_matches("ord-"));
-            let cost_basis = order.amount + order.costs.tx_costs();
+            let cost_basis = charged + order.costs.tx_costs();
             let position = Position {
                 position_id: pid.clone(),
                 book_id: book.id.clone(),

@@ -63,14 +63,18 @@ export default function Page() {
         <h1>Pandarianz Solana Hybrid Sniper</h1>
         <div className="badges">
           <span className="badge paper" title="No keys, no signing, no broadcasting">PAPER ONLY</span>
-          {mode && <span className={`badge ${mode}`}>{mode} DATA</span>}
+          {mode && <span className={`badge ${mode}`}>{mode === "LIVE" ? "LIVE DATA / PAPER TRADING" : mode === "FIXTURE" ? "OFFLINE FIXTURE" : "REPLAY"}</span>}
+          {snap?.feed_status && <span className={`badge feed-${snap.feed_status.state}`} title={snap.feed_status.reasons.join("; ")}>FEED {snap.feed_status.state}</span>}
           <span className="badge neutral mono">{snap?.strategy_version ?? "…"}</span>
           <span className={`badge neutral`}>{err ? "engine unreachable" : snap?.health.ended ? "source ended" : snap ? "streaming" : "connecting"}</span>
         </div>
       </header>
 
       {err && <div className="note"><span className="err">Engine API unreachable:</span> {err}. Start it with <code className="mono">./scripts/sniper start</code>. Showing last known data{fetchedAt ? ` from ${new Date(fetchedAt).toLocaleTimeString()}` : ""}.</div>}
-      {snap && <div className={`note ${mode ?? ""}`}>{snap.data_mode_note} Profile <span className="mono">{snap.profile_key}</span>.</div>}
+      {snap && <div className={`note ${mode ?? ""}`}><strong>{snap.status_banner}.</strong> {snap.data_mode_note} Profile <span className="mono">{snap.profile_key}</span>.</div>}
+      {snap?.feed_status && snap.feed_status.state !== "HEALTHY" && (
+        <div className="note DOWN"><strong>Feed {snap.feed_status.state}: new entries are blocked.</strong> {snap.feed_status.reasons.join("; ")}</div>
+      )}
 
       {snap && book && (
         <div className="grid">
@@ -135,6 +139,81 @@ export default function Page() {
           </section>
 
           <section className="card span-6">
+            <h2>Live feed &amp; coverage</h2>
+            {snap.feed_status ? (
+              <>
+                <dl className="kv">
+                  <Row k="state" v={`${snap.feed_status.state} (${snap.feed_status.providers_up}/${snap.feed_status.providers_total} providers up)`} />
+                  <Row k="coverage (healthy time)" v={pct(snap.feed_status.coverage)} />
+                  <Row k="chain tip" v={snap.feed_status.tip_slot ? `${snap.feed_status.tip_slot} · ${ms((snap.feed_status.tip_age_ms ?? 0) * 1000)} ago` : "no tip subscription"} />
+                  <Row k="slot lag (tip − newest event)" v={snap.feed_status.slot_lag == null ? "–" : `${snap.feed_status.slot_lag} slots`} />
+                  <Row k="last event" v={snap.feed_status.last_event_age_ms == null ? "–" : ms(snap.feed_status.last_event_age_ms * 1000) + " ago"} />
+                  {snap.tx_fetch && <Row k="tx fetch (logs→getTransaction)" v={`${snap.tx_fetch.fetched}/${snap.tx_fetch.requested} · ${snap.tx_fetch.not_found} missing · mean ${snap.tx_fetch.mean_fetch_ms?.toFixed(0) ?? "–"} ms`} />}
+                  {snap.backfill && <Row k="startup backfill" v={`${snap.backfill.transactions_loaded} txs in ${snap.backfill.duration_ms.toFixed(0)} ms`} />}
+                </dl>
+                <div className="tablewrap" style={{ marginTop: 8 }}>
+                  <table>
+                    <thead><tr><th>provider</th><th>state</th><th className="num">first deliveries</th><th className="num">reconnects</th><th className="num">tip</th></tr></thead>
+                    <tbody>{Object.entries(snap.providers).map(([k, p]) => (
+                      <tr key={k}><td>{k}</td><td>{p.state ?? "?"}</td><td className="num">{p.first_deliveries}</td><td className="num">{p.reconnects}</td><td className="num">{p.tip_slot ?? "–"}</td></tr>
+                    ))}</tbody>
+                  </table>
+                </div>
+                {snap.rpc_endpoints.length > 0 && (
+                  <div className="tablewrap" style={{ marginTop: 8 }}>
+                    <table>
+                      <thead><tr><th>RPC (read-only)</th><th className="num">ok</th><th className="num">errors</th><th className="num">429</th><th>last error</th></tr></thead>
+                      <tbody>{snap.rpc_endpoints.map((r) => (
+                        <tr key={r.host}><td>{r.host}</td><td className="num">{r.ok}</td><td className="num">{r.errors}</td><td className="num">{r.rate_limited}</td><td>{r.last_error?.slice(0, 40) ?? "–"}</td></tr>
+                      ))}</tbody>
+                    </table>
+                  </div>
+                )}
+                <h2 style={{ marginTop: 12 }}>Observation gaps</h2>
+                {[...(snap.feed_status.open_gap ? [snap.feed_status.open_gap] : []), ...snap.feed_status.recent_gaps].length === 0 ? <div className="empty">No gaps.</div> : (
+                  <ul style={{ margin: 0, paddingLeft: 18, fontSize: 12 }}>
+                    {[...(snap.feed_status.open_gap ? [snap.feed_status.open_gap] : []), ...snap.feed_status.recent_gaps].slice(0, 8).map((g, i) => (
+                      <li key={i}>{time(g.start_us)}–{g.end_us ? time(g.end_us) : "ongoing"} · {g.state} · {g.reason}</li>
+                    ))}
+                  </ul>
+                )}
+              </>
+            ) : <div className="empty">Offline source — no live feed in this mode.</div>}
+          </section>
+
+          <section className="card span-6">
+            <h2>Execution quality &amp; fill outcomes</h2>
+            <div className="tiles">
+              <Tile label="Fills" value={String(snap.counters.fills_ok ?? 0)} sub={`${snap.counters.fills_failed_slippage ?? 0} slippage fails · ${snap.counters.fills_dropped ?? 0} dropped`} />
+              <Tile label="No fill (no route)" value={String(snap.counters.fills_no_route ?? 0)} sub={`${snap.counters.fills_stale_state ?? 0} refused: stale state`} />
+              <Tile label="Aggregator observations" value={String(snap.counters.order_observations_attached ?? 0)} sub="live Jupiter quotes attached to orders" />
+              <Tile label="Vs real trades" value={`${snap.execution_quality.compared}/${snap.execution_quality.checks}`} sub="fills compared with next market trade" />
+              <Tile label="Median adverse" value={snap.execution_quality.median_adverse_bps == null ? "–" : `${snap.execution_quality.median_adverse_bps.toFixed(0)} bps`} sub="+ = simulation worse than market" />
+              <Tile label="Within ±150 bps" value={pct(snap.execution_quality.within_150bps)} />
+            </div>
+            <p className="empty" style={{ fontStyle: "normal" }}>Each order keeps three things apart: the decision quote, the simulated fill (venue simulation, or conservative min with a live aggregator quote) and the observed market execution of the next same-side trade.</p>
+          </section>
+
+          <section className="card span-6">
+            <h2>Strategy performance — {book.scenario}</h2>
+            <div className="tablewrap">
+              <table>
+                <thead><tr><th>strategy</th><th className="num">trades</th><th className="num">win</th><th className="num">net SOL</th><th className="num">expectancy</th><th className="num">PF</th><th className="num">max DD</th></tr></thead>
+                <tbody>{Object.entries(book.perf_by_path ?? {}).map(([k, p]) => (
+                  <tr key={k}><td>{k === "launch" ? "launch sniper" : "momentum scanner"}</td><td className="num">{p.closed_trades}</td><td className="num">{pct(p.win_rate)}</td>
+                    <td className={`num ${cls(p.realized_pnl_sol)}`}>{signed(p.realized_pnl_sol)}</td><td className={`num ${cls(p.expectancy_sol)}`}>{signed(p.expectancy_sol, 5)}</td>
+                    <td className="num">{p.profit_factor == null ? "–" : p.profit_factor.toFixed(2)}</td><td className="num">{sol(p.max_drawdown_sol)}</td></tr>
+                ))}</tbody>
+              </table>
+            </div>
+          </section>
+
+          <section className="card span-6">
+            <h2>Forward evaluation (probe {"0.05"} SOL, net of fees)</h2>
+            <ForwardTable rows={snap.forward_summary} pending={snap.forward_pending} />
+          </section>
+
+          <section className="card span-6">
             <h2>Latency (measured, this process)</h2>
             <div className="tablewrap">
               <table>
@@ -183,6 +262,18 @@ export default function Page() {
           <section className="card span-8">
             <h2>Trade journal — {book.scenario}</h2>
             <Journal rows={trades} />
+          </section>
+
+          <section className="card span-12">
+            <h2>Decoder verification</h2>
+            <div className="tablewrap">
+              <table>
+                <thead><tr><th>venue</th><th>item</th><th>status</th><th>evidence</th></tr></thead>
+                <tbody>{snap.decoder_verification.map((v, i) => (
+                  <tr key={i}><td>{v.venue}</td><td>{v.item}</td><td className={v.status === "idl_verified" ? "pos" : "warn"}>{v.status}</td><td style={{ whiteSpace: "normal" }}>{v.evidence}</td></tr>
+                ))}</tbody>
+              </table>
+            </div>
           </section>
 
           <section className="card span-4">
@@ -269,6 +360,25 @@ function Candidates({ rows }: { rows: Candidate[] }) {
           ))}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+function ForwardTable({ rows, pending }: { rows: Record<string, { n: number; unsellable: number; mean_net_return: number | null; median_net_return: number | null; positive_fraction: number | null }>; pending: number }) {
+  const entries = Object.entries(rows).filter(([k]) => !k.startsWith("reject:")).sort();
+  const rejects = Object.entries(rows).filter(([k]) => k.startsWith("reject:") && k.endsWith("@120s")).sort((a, b) => b[1].n - a[1].n).slice(0, 8);
+  if (!entries.length) return <div className="empty">No forward outcomes yet ({pending} probes pending).</div>;
+  const row = ([k, b]: [string, { n: number; unsellable: number; mean_net_return: number | null; median_net_return: number | null; positive_fraction: number | null }]) => (
+    <tr key={k}><td>{k}</td><td className="num">{b.n}</td><td className={`num ${cls(b.mean_net_return)}`}>{b.mean_net_return == null ? "–" : `${(b.mean_net_return * 100).toFixed(1)}%`}</td>
+      <td className="num">{b.median_net_return == null ? "–" : `${(b.median_net_return * 100).toFixed(1)}%`}</td><td className="num">{pct(b.positive_fraction)}</td><td className="num">{b.unsellable}</td></tr>
+  );
+  return (
+    <div className="tablewrap">
+      <table>
+        <thead><tr><th>bucket</th><th className="num">n</th><th className="num">mean</th><th className="num">median</th><th className="num">&gt; 0</th><th className="num">unsellable</th></tr></thead>
+        <tbody>{entries.map(row)}{rejects.length > 0 && <tr><td colSpan={6} className="empty">top rejection reasons @120s (would rejected candidates have paid?)</td></tr>}{rejects.map(row)}</tbody>
+      </table>
+      <p className="empty" style={{ fontStyle: "normal" }}>{pending} probes pending. Outcomes are recorded after each horizon and never feed back into decisions.</p>
     </div>
   );
 }

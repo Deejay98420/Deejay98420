@@ -5,3 +5,4 @@ dashboard/.next/
 .run/
 *.log
 *.tsbuildinfo
+reports/

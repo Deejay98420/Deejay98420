@@ -1,6 +1,16 @@
 # Assumptions, cost model and limitations
 
-## Venue layouts (from public IDLs; verify against captured mainnet transactions)
+## Venue layouts
+
+Pump.fun and PumpSwap layouts are verified against the official IDLs (`fixtures/idl/`, with provenance and sha256) in `tests/idl_verification.rs`. They have not yet been verified against captured mainnet transactions (pending RPC access; see `fixtures/real/README.md`).
+
+Open semantic assumptions that only real captures can settle (`tests/real_fixtures.rs` checks them):
+
+- **Curve `TradeEvent.sol_amount` is net of fees.** For observed execution checks, buyers pay `sol_amount + fee + creator_fee` and sellers receive `sol_amount − fees`.
+- **PumpSwap pool vault updates.** v2 trades may leave protocol/creator fees inside the vault and offset them in `virtual_quote_reserves`. Each swap event carries the absolute pre-trade reserves, so any drift self-corrects on the next event.
+- **Buyback and holder-reward fees** are taken to be slices of the protocol/creator fee, not extra charges. **Cashback** is treated as zero (conservative).
+
+## Earlier layout notes
 
 - **Pump.fun (`6EF8…F6P`)**: Anchor `emit!` → `Program data:` logs. Events:
   - `CreateEvent` (name, symbol, uri, mint, bonding_curve, user; optional creator, timestamp, reserves, supply);
@@ -29,11 +39,18 @@
 
 Realized P&L is computed as proceeds − exit tx costs − failed-exit fees − cost basis, where cost basis is size + entry tx costs. Tests check that it equals the sum of the position's ledger entries, both in memory and in SQL.
 
+## Measurement caveats
+
+- **Execution checks** compare our simulated fill with the *next* same-side market trade within 5 s. In a trending market this is biased: in a pump, later buys pay more, so our buys look better. Sizes also differ. Read it as a sanity bound, not as slippage.
+- **Forward evaluation** uses a 0.05 SOL probe quoted at decision time, with no latency or failures, and fixed costs of two base-scenario transactions. It is an opportunity measure, not a P&L.
+- **The expected-move model** (`expected_move_scale_bps`) is an uncalibrated heuristic prior. Calibrate it against forward outcomes before trusting `min_net_edge_bps`.
+
 ## Known limitations
 
 - Paper fills don't change the observed reserves, so other traders never react to our trades. Exit quotes include the impact of our own position. Entry quotes don't model how others would trade around us.
 - Holder concentration comes from venue trades only; transfers are invisible. It is flagged `concentration_complete=false` for tokens not seen from creation.
-- Mint and Token-2022 extension checks (freeze authority, transfer hooks, etc.) are not implemented. Sellability is inferred from observed non-creator sells and from an executable sell quote existing.
+- Mint checks run only in LIVE mode with RPC. Fixture mode has no mint accounts; the check is skipped there and the docs and status say so. Mint authority is reported as a warning, not a blocker, because whether pump.fun revokes it on every create path has not been verified.
 - Jupiter is used for route coverage and exit fallback in LIVE mode only. It is disabled in fixture/replay, and the route stats say so explicitly. The default quote URL must be set in `.env`; check your Jupiter plan and API version.
-- With `logsSubscribe`, Pump.fun events are visible but PumpSwap events are not; use `transactionSubscribe`. Unknown PumpSwap pools are not resolved via RPC.
-- A Yellowstone/gRPC source is not implemented. The `StreamMsg` interface is the extension point, including `Slot{Dead}` for fork handling. Standard WS subscriptions use `confirmed` commitment, where rollbacks are rare.
+- With `logsSubscribe`, PumpSwap transactions are fetched with `getTransaction`. That adds measured latency (`tx_fetch`) and RPC load. `transactionSubscribe` avoids it where the provider offers it.
+- Raydium v4 remains decode-only: `ray_log` has no pool/mint identifiers, and its layout is unverified.
+- A Yellowstone/gRPC source is not implemented (its proto crates depend on the Solana SDK, which the safety policy forbids). The `StreamMsg` interface is the extension point, including `Slot{Dead}` for fork handling. Standard WS subscriptions use `confirmed` commitment, where rollbacks are rare.

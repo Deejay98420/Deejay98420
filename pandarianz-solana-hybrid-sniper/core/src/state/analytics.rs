@@ -62,6 +62,15 @@ pub struct Features {
     pub ms_since_last_event: f64,
     pub non_creator_sell_seen: bool,
     pub liquidity_removed_lamports: u64,
+    /// 10s buy rate / 60s buy rate (SOL per second); >1 = accelerating
+    pub buy_acceleration: f64,
+    /// unique buyers in the last 10s ×3 / unique buyers in the last 30s; >1 = growing
+    pub unique_buyer_growth: f64,
+    /// fraction of the six 10s buckets in the last 60s with positive net flow
+    pub momentum_persistence: f64,
+    /// 1 − worst peak-to-trough liquidity drawdown over the last 60s (1.0 = no drawdown)
+    pub liquidity_stability: f64,
+    pub quote_non_sol: bool,
 }
 
 fn window(st: &TokenState, now_us: i64, secs: u32) -> Window {
@@ -103,6 +112,12 @@ fn window(st: &TokenState, now_us: i64, secs: u32) -> Window {
         }
     }
     w
+}
+
+fn w10_buy_rate(st: &TokenState, now_us: i64, secs: i64) -> f64 {
+    let lo = now_us - secs * 1_000_000;
+    let sum: u64 = st.trades.iter().filter(|t| t.is_buy && t.ts_us > lo && t.ts_us <= now_us).map(|t| t.sol).sum();
+    sum as f64 / secs as f64
 }
 
 pub fn compute(st: &TokenState, now_us: i64) -> Features {
@@ -152,7 +167,46 @@ pub fn compute(st: &TokenState, now_us: i64) -> Features {
         (1.0 - c.real_token as f64 / initial_real_token).clamp(0.0, 1.0)
     });
 
+    let rate10 = w10_buy_rate(st, now_us, 10);
+    let rate60 = w10_buy_rate(st, now_us, 60);
+    let buy_acceleration = if rate60 > 0.0 { rate10 / rate60 } else if rate10 > 0.0 { 2.0 } else { 0.0 };
+    let (u10, u30) = (window(st, now_us, 10).unique_buyers as f64, window(st, now_us, 30).unique_buyers as f64);
+    let unique_buyer_growth = if u30 > 0.0 { u10 * 3.0 / u30 } else { 0.0 };
+    let mut pos_buckets = 0;
+    let mut active_buckets = 0;
+    for b in 0..6 {
+        let (lo, hi) = (now_us - (b + 1) * 10_000_000, now_us - b * 10_000_000);
+        let mut net = 0i64;
+        let mut any = false;
+        for t in st.trades.iter().filter(|t| t.ts_us > lo && t.ts_us <= hi) {
+            any = true;
+            net += if t.is_buy { t.sol as i64 } else { -(t.sol as i64) };
+        }
+        if any {
+            active_buckets += 1;
+            if net > 0 {
+                pos_buckets += 1;
+            }
+        }
+    }
+    let momentum_persistence = if active_buckets > 0 { pos_buckets as f64 / 6.0 } else { 0.0 };
+    // stability = 1 − worst peak-to-trough liquidity drawdown in the last 60s (growth is stable)
+    let mut peak_liq = 0u64;
+    let mut worst_dd = 0f64;
+    for (_, l) in st.liq_samples.iter().filter(|(t, _)| *t >= now_us - 60_000_000 && *t <= now_us) {
+        peak_liq = peak_liq.max(*l);
+        if peak_liq > 0 {
+            worst_dd = worst_dd.max(1.0 - *l as f64 / peak_liq as f64);
+        }
+    }
+    let liquidity_stability = 1.0 - worst_dd;
+
     Features {
+        buy_acceleration,
+        unique_buyer_growth,
+        momentum_persistence,
+        liquidity_stability,
+        quote_non_sol: st.quote_non_sol,
         mint: st.mint,
         origin: st.origin,
         phase: st.phase,

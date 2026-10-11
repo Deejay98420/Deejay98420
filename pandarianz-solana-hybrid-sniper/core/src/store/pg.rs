@@ -8,6 +8,7 @@ use anyhow::Context;
 use tokio_postgres::{Client, NoTls};
 
 pub const MIGRATION_001: &str = include_str!("../../../migrations/001_init.sql");
+pub const MIGRATION_002: &str = include_str!("../../../migrations/002_forward_eval.sql");
 
 pub struct PgStore {
     pub client: Client,
@@ -32,9 +33,12 @@ impl PgStore {
     pub async fn migrate(&self) -> anyhow::Result<()> {
         // serialize concurrent migrators
         self.client.batch_execute("select pg_advisory_lock(727274)").await?;
-        let r = self.client.batch_execute(MIGRATION_001).await;
+        let r = match self.client.batch_execute(MIGRATION_001).await {
+            Ok(()) => self.client.batch_execute(MIGRATION_002).await.context("applying migration 002"),
+            Err(e) => Err(anyhow::Error::from(e).context("applying migration 001")),
+        };
         self.client.batch_execute("select pg_advisory_unlock(727274)").await?;
-        r.context("applying migration 001")?;
+        r?;
         Ok(())
     }
 
@@ -127,6 +131,30 @@ impl PgStore {
                 c.execute(
                     "insert into route_checks (profile_key, ts_us, mint, side, source, ok, latency_us, error, doc) values ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
                     &[pk, &r.ts_us, &r.mint, &r.side, &r.source, &r.ok, &r.latency_us, &r.error, &doc],
+                )
+                .await?;
+            }
+            StoreCmd::ObservationGap { run_id: run, gap: g } => {
+                let doc = serde_json::to_value(&g)?;
+                c.execute(
+                    "insert into observation_gaps (profile_key, run_id, start_us, end_us, state, reason, doc) values ($1,$2,$3,$4,$5,$6,$7)",
+                    &[pk, &run, &g.start_us, &g.end_us, &status_str(&g.state), &g.reason, &doc],
+                )
+                .await?;
+            }
+            StoreCmd::ForwardOutcome(f) => {
+                let doc = serde_json::to_value(&*f)?;
+                c.execute(
+                    "insert into forward_outcomes (profile_key, eval_id, mint, path, decision, horizon_s, t0_us, net_return, doc) values ($1,$2,$3,$4,$5,$6,$7,$8,$9) on conflict do nothing",
+                    &[pk, &f.eval_id, &f.mint, &f.path, &f.decision, &(f.horizon_s as i32), &f.t0_us, &f.net_return, &doc],
+                )
+                .await?;
+            }
+            StoreCmd::ExecutionCheck(x) => {
+                let doc = serde_json::to_value(&*x)?;
+                c.execute(
+                    "insert into execution_checks (profile_key, order_id, book_id, outcome, adverse_bps, doc) values ($1,$2,$3,$4,$5,$6) on conflict do nothing",
+                    &[pk, &x.order_id, &x.book_id, &x.outcome, &x.adverse_bps, &doc],
                 )
                 .await?;
             }

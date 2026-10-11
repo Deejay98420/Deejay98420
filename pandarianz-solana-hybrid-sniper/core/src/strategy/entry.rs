@@ -27,6 +27,17 @@ pub struct EntryDecision {
     pub quote: Option<Quote>,
     pub reasons: Vec<RejectReason>,
     pub size_checks: Vec<SizeCheck>,
+    /// heuristic, UNCALIBRATED expected favourable move (bps) — see `expected_move_bps`
+    pub expected_move_bps: f64,
+    /// expected move − estimated round-trip cost of the selected (or smallest checked) size
+    pub net_edge_bps: Option<f64>,
+}
+
+/// Heuristic expected move: scale × blend(score, persistence, acceleration). It is a prior, not a
+/// prediction; forward evaluation records whether it is calibrated.
+pub fn expected_move_bps(score: f64, f: &Features, cfg: &StrategyConfig) -> f64 {
+    let accel = clamp01((f.buy_acceleration - 0.5) / 1.5);
+    cfg.entry.expected_move_scale_bps * (0.5 * clamp01(score) + 0.3 * clamp01(f.momentum_persistence) + 0.2 * accel)
 }
 
 fn clamp01(x: f64) -> f64 {
@@ -66,6 +77,12 @@ pub fn score(path: EntryPath, f: &Features, cfg: &StrategyConfig) -> f64 {
 fn market_filters(path: EntryPath, st: &TokenState, f: &Features, cfg: &StrategyConfig, lag_ms: Option<f64>) -> Vec<RejectReason> {
     let e = &cfg.entry;
     let mut r = Vec::new();
+    if f.quote_non_sol {
+        r.push(RejectReason::NonSolQuote);
+    }
+    if f.trades_total >= 5 && f.liquidity_stability < e.min_liquidity_stability {
+        r.push(RejectReason::LiquidityUnstable { stability: f.liquidity_stability, min: e.min_liquidity_stability });
+    }
     if f.ms_since_last_event > e.max_state_age_ms {
         r.push(RejectReason::StaleState { age_ms: f.ms_since_last_event, max_ms: e.max_state_age_ms });
     }
@@ -266,9 +283,32 @@ pub fn evaluate(
             }
         }
     }
+    let expected = expected_move_bps(score, f, cfg);
+    let cost = checks
+        .iter()
+        .find(|c| c.ok)
+        .or_else(|| checks.iter().filter(|c| c.round_trip_cost_bps.is_finite()).last())
+        .map(|c| c.round_trip_cost_bps)
+        .filter(|c| c.is_finite());
+    let net_edge = cost.map(|c| expected - c);
+    if let (Some(edge), Some(c)) = (net_edge, cost) {
+        if chosen.is_some() && edge < e.min_net_edge_bps {
+            reasons.push(RejectReason::InsufficientEdge { expected_move_bps: expected, round_trip_cost_bps: c, edge_bps: edge, min_bps: e.min_net_edge_bps });
+        }
+    }
     let enter = reasons.is_empty() && chosen.is_some();
     let (size, quote) = chosen.map(|(s, q)| (s, Some(q))).unwrap_or((0, None));
-    EntryDecision { path, score, enter, size_lamports: if enter { size } else { 0 }, quote: if enter { quote } else { None }, reasons, size_checks: checks }
+    EntryDecision {
+        path,
+        score,
+        enter,
+        size_lamports: if enter { size } else { 0 },
+        quote: if enter { quote } else { None },
+        reasons,
+        size_checks: checks,
+        expected_move_bps: expected,
+        net_edge_bps: net_edge,
+    }
 }
 
 pub fn lamports_to_sol_str(l: u64) -> String {

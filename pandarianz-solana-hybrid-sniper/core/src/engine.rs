@@ -5,10 +5,15 @@
 use crate::config::EngineConfig;
 use crate::decode::{decode_raw, Decoded};
 use crate::metrics::{perf, LatencySeries, LatencySummary, PerfStats, RouteStats};
+use crate::execcheck::{ExecChecker, ExecSummary, ExecutionCheck};
+use crate::feed::{FeedMonitor, FeedState, FeedStatus};
+use crate::forward::{ForwardBucket, ForwardOutcome, ForwardTracker, Probe};
+use crate::live::{FetchSnapshot, FetchStats};
 use crate::paper::{
-    entry_reservation, fill_order, latency_us, Book, FillOutcome, Order, OrderKind, OrderStatus, Position,
-    PositionStatus,
+    entry_reservation, fill_order_with, latency_us, Book, FillBasisMode, FillOutcome, Order, OrderKind, OrderStatus,
+    Position, PositionStatus,
 };
+use crate::rpc::{EndpointStats, RpcClient};
 use crate::quote::jupiter::JupiterClient;
 use crate::quote::{venue_quote, Quote, QuoteError, QuoteSource, Side, VenueFees};
 use crate::state::analytics::{compute, Features};
@@ -29,6 +34,10 @@ use tokio::sync::mpsc;
 #[derive(Debug)]
 pub enum Control {
     Jupiter(JupResult),
+    /// PumpSwap pool account lookup result: (base_mint, quote_mint)
+    PoolResolved { pool: Pubkey, result: Result<Option<(Pubkey, Pubkey)>, String> },
+    MintChecked { mint: Pubkey, result: Result<crate::safety::MintSafety, String> },
+    BackfillDone(crate::live::BackfillReport),
     Shutdown,
 }
 
@@ -40,10 +49,10 @@ pub struct JupResult {
 
 #[derive(Debug, Clone)]
 enum JupPurpose {
-    /// route-coverage comparison only
-    Coverage,
     /// exit route fallback for a position with no venue route
     Exit { book_idx: usize, position_id: String, attempt: u32 },
+    /// live executable quote observation attached to a pending order
+    ObserveOrder { book_idx: usize, order_id: String },
 }
 
 #[derive(Debug, Clone)]
@@ -131,12 +140,26 @@ pub struct BookView {
     pub open_positions: Vec<Position>,
     pub pending_orders: usize,
     pub perf: PerfStats,
+    /// strategy-specific performance (launch sniper vs momentum scanner)
+    pub perf_by_path: BTreeMap<String, PerfStats>,
     pub accounting_ok: bool,
     pub accounting_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Default)]
 pub struct Snapshot {
+    pub feed_status: Option<FeedStatus>,
+    pub providers: BTreeMap<String, crate::feed::ProviderHealth>,
+    pub rpc_endpoints: Vec<EndpointStats>,
+    pub tx_fetch: Option<FetchSnapshot>,
+    pub backfill: Option<crate::live::BackfillReport>,
+    pub forward_summary: BTreeMap<String, ForwardBucket>,
+    pub forward_pending: usize,
+    pub execution_quality: ExecSummary,
+    pub recent_execution_checks: Vec<ExecutionCheck>,
+    pub decoder_verification: Vec<crate::decode::Verification>,
+    pub counters: EngineCounters,
+    pub status_banner: String,
     pub generated_us: i64,
     pub paper_only: bool,
     pub data_mode: Option<DataMode>,
@@ -166,6 +189,14 @@ pub struct EngineOptions {
     pub run_id: String,
     pub jupiter: Option<Arc<JupiterClient>>,
     pub ingest_stats: Option<crate::stream::Ingestor>,
+}
+
+/// Optional live-mode services (read-only RPC, fetcher statistics).
+#[derive(Default, Clone)]
+pub struct LiveServices {
+    pub rpc: Option<Arc<RpcClient>>,
+    pub fetch_stats: Option<Arc<FetchStats>>,
+    pub backfill: Option<crate::live::BackfillReport>,
 }
 
 pub struct Engine {
@@ -199,8 +230,37 @@ pub struct Engine {
     pub entries_decided: u64,
     last_publish_wall: i64,
     boot_cmds: Vec<StoreCmd>,
+    pub feed_mon: FeedMonitor,
+    fwd: ForwardTracker,
+    fwd_recent: VecDeque<ForwardOutcome>,
+    exec: ExecChecker,
+    exec_recent: VecDeque<ExecutionCheck>,
+    pub live: LiveServices,
+    pool_reqs: HashSet<Pubkey>,
+    mint_reqs: HashSet<Pubkey>,
+    pub stats: EngineCounters,
     /// stop the run loop when a finite source ends (fixture/replay without --hold)
     pub exit_on_end: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Default)]
+pub struct EngineCounters {
+    pub backfill_events: u64,
+    pub pools_resolution_requested: u64,
+    pub pools_resolved: u64,
+    pub pools_non_sol: u64,
+    pub mint_checks_requested: u64,
+    pub mint_checks_ok: u64,
+    pub mint_checks_risky: u64,
+    pub mint_checks_failed: u64,
+    pub entries_blocked_feed: u64,
+    pub fills_stale_state: u64,
+    pub fills_no_route: u64,
+    pub fills_dropped: u64,
+    pub fills_failed_slippage: u64,
+    pub fills_ok: u64,
+    pub order_observations_attached: u64,
+    pub stale_quote_rejections: u64,
 }
 
 fn lat_series() -> LatencySeries {
@@ -213,7 +273,19 @@ impl Engine {
         let clock = if opts.data_mode == DataMode::Live { Clock::Wall } else { Clock::Event { now_us: 0 } };
         let fees = VenueFees { curve_fee_bps_default: cfg.costs.curve_fee_bps_default, pumpswap_fee_bps: cfg.costs.pumpswap_fee_bps };
         let mut lat = BTreeMap::new();
-        for k in ["provider_delivery_lag", "queue_wait", "decode", "evaluate", "event_to_decision", "venue_quote", "jupiter_quote", "fill_latency_sim"] {
+        for k in [
+            "provider_delivery_lag",
+            "queue_wait",
+            "decode",
+            "evaluate",
+            "event_to_decision",
+            "venue_quote",
+            "jupiter_quote",
+            "fill_latency_sim",
+            "tx_fetch",
+            "slot_lag_slots",
+            "end_to_end_recv_to_order",
+        ] {
             lat.insert(k, lat_series());
         }
         let mut e = Self {
@@ -246,6 +318,15 @@ impl Engine {
             entries_decided: 0,
             last_publish_wall: 0,
             boot_cmds: Vec::new(),
+            feed_mon: FeedMonitor::new(cfg.feed_health.clone(), opts.data_mode == DataMode::Live),
+            fwd: ForwardTracker::default(),
+            fwd_recent: VecDeque::new(),
+            exec: ExecChecker::new(cfg.exec_check_window_s),
+            exec_recent: VecDeque::new(),
+            live: LiveServices::default(),
+            pool_reqs: HashSet::new(),
+            mint_reqs: HashSet::new(),
+            stats: EngineCounters::default(),
             exit_on_end: false,
             cfg,
         };
@@ -426,7 +507,12 @@ impl Engine {
                     SlotStatus::Confirmed => {}
                 }
             }
+            StreamMsg::Tip { provider, slot, recv_us } => {
+                self.feed_mon.on_tip(&provider, slot, recv_us);
+                self.feed_tick(self.now()).await;
+            }
             StreamMsg::Connection { provider, state, detail, recv_us } => {
+                self.feed_mon.on_connection(&provider, state, &detail, recv_us);
                 let c = self.health.connections.entry(provider).or_default();
                 if state == ConnState::Reconnecting {
                     c.reconnects += 1;
@@ -434,6 +520,7 @@ impl Engine {
                 c.state = Some(state);
                 c.detail = detail;
                 c.since_us = recv_us;
+                self.feed_tick(self.now()).await;
             }
             StreamMsg::End { recv_us, .. } => {
                 self.clock.observe(recv_us);
@@ -457,7 +544,7 @@ impl Engine {
             tracing::error!("live-labelled event in non-live engine rejected");
             return;
         }
-        if let Clock::Wall = self.clock {
+        if let (Clock::Wall, false) = (&self.clock, raw.backfill) {
             self.lat("queue_wait", dequeued_us - raw.recv_us);
         }
         self.clock.observe(raw.recv_us);
@@ -472,6 +559,29 @@ impl Engine {
                 return;
             }
             Admit::New => {}
+        }
+        if raw.backfill {
+            // Historical transaction: rebuild state only. Never triggers evaluation or trades.
+            self.stats.backfill_events += 1;
+            self.store.send(StoreCmd::RawEvent { run_id: self.run_id.clone(), ev: Box::new(raw.clone()) }).await;
+            let out = decode_raw(&raw);
+            if !out.tx_failed {
+                for Decoded { index, event } in out.events {
+                    self.health.decoded_events += 1;
+                    self.universe.apply(Input { slot: raw.slot, signature: raw.signature.clone(), index, ts_us: raw.recv_us, event });
+                }
+            }
+            self.request_lookups().await;
+            return;
+        }
+        if self.mode == DataMode::Live {
+            self.feed_mon.on_event(&raw.provider, raw.slot, raw.recv_us);
+            if let Some(tip) = self.feed_mon.tip_slot() {
+                self.lat("slot_lag_slots", tip as i64 - raw.slot as i64);
+            }
+            if let Some(f) = raw.fetch_us {
+                self.lat("tx_fetch", f);
+            }
         }
         // Settle due orders against the state BEFORE this event (state as of their fill time).
         self.process_due(now, false).await;
@@ -509,6 +619,20 @@ impl Engine {
         self.health.tokens_tracked = self.universe.tokens.len();
         self.health.unresolved_pool_events = self.universe.unresolved_pool_events;
         self.health.raydium_decode_only = self.universe.raydium_decode_only;
+
+        // observed-execution comparisons against real trades
+        for (mint, a) in &touched {
+            if let Change::Trade { .. } = a.change {
+                if let Some(t) = self.universe.tokens.get(mint).and_then(|st| st.trades.back()).cloned() {
+                    for c in self.exec.on_trade(mint, &t) {
+                        self.record_exec_check(c).await;
+                    }
+                }
+            }
+        }
+        self.request_lookups().await;
+        self.feed_tick(now).await;
+        self.background_tick(now).await;
 
         let mut seen = HashSet::new();
         for (mint, a) in touched {
@@ -582,12 +706,35 @@ impl Engine {
         let t0 = wall_us();
         let lag_ms = if self.mode == DataMode::Live { stamps.delivery_lag_us().map(|l| l as f64 / 1e3) } else { None };
         let base = self.cfg.scenarios.iter().find(|s| s.name == "base").cloned().unwrap_or_default();
-        let (f, d, symbol) = {
+        let (f, mut d, symbol, mint_safety) = {
             let Some(st) = self.universe.tokens.get(&mint) else { return };
             let f = compute(st, now);
             let d = evaluate(st, &f, &self.cfg.strategy, &self.cfg.costs, &base, lag_ms, now);
-            (f, d, st.symbol.clone())
+            (f, d, st.symbol.clone(), st.mint_safety.clone())
         };
+        if self.mode == DataMode::Live {
+            let e = &self.cfg.strategy.entry;
+            if e.block_entries_when_feed_unhealthy && self.feed_mon.state() != FeedState::Healthy {
+                let st = self.feed_mon.status(now);
+                d.reasons.push(RejectReason::FeedUnhealthy { state: format!("{:?}", st.state), reasons: st.reasons });
+                self.stats.entries_blocked_feed += 1;
+            }
+            if e.require_mint_check {
+                match &mint_safety {
+                    None => d.reasons.push(RejectReason::MintUnchecked {
+                        detail: if self.live.rpc.is_some() { "mint check pending".into() } else { "no RPC configured for mint checks".into() },
+                    }),
+                    Some(Err(err)) => d.reasons.push(RejectReason::MintUnchecked { detail: err.clone() }),
+                    Some(Ok(ms)) if !ms.is_safe() => d.reasons.push(RejectReason::MintRisk { risks: ms.risks.clone() }),
+                    _ => {}
+                }
+            }
+            if !d.reasons.is_empty() {
+                d.enter = false;
+                d.quote = None;
+                d.size_lamports = 0;
+            }
+        }
         let eval_us = wall_us() - t0;
         self.lat("evaluate", eval_us);
         if self.mode == DataMode::Live {
@@ -600,7 +747,6 @@ impl Engine {
             if let Some(q) = &d.quote {
                 self.note_route("venue_sim", &Ok(q.clone()), now);
             }
-            self.request_coverage_quote(mint, Side::Buy, d.size_lamports, now).await;
             self.submit_entries(mint, &d, &f, raw, now).await;
         }
     }
@@ -665,7 +811,28 @@ impl Engine {
             trigger_signature: raw.signature.clone(),
             trigger_slot: raw.slot,
             stamps: serde_json::to_value(stamps).unwrap_or_default(),
+            expected_move_bps: Some(d.expected_move_bps),
+            net_edge_bps: d.net_edge_bps,
         };
+        // forward evaluation probe (accepted and rejected alike); outcomes are written later
+        if self.cfg.forward.enabled {
+            if let Some(st) = self.universe.tokens.get(&mint) {
+                if let Ok(q) = venue_quote(st, Side::Buy, self.cfg.forward.probe_lamports, 0, &self.fees, f64::MAX, now) {
+                    self.fwd.add(Probe {
+                        eval_id: rec.eval_id.clone(),
+                        mint,
+                        path: rec.path.clone(),
+                        decision: rec.decision.clone(),
+                        reason_codes: codes.clone(),
+                        t0_us: now,
+                        probe_lamports: self.cfg.forward.probe_lamports,
+                        entry_in: q.in_amount,
+                        tokens: q.out_amount,
+                        horizons_s: self.cfg.forward.horizons_s.clone(),
+                    });
+                }
+            }
+        }
         self.store.send(StoreCmd::Evaluation(Box::new(rec))).await;
     }
 
@@ -675,7 +842,8 @@ impl Engine {
         let risk = self.cfg.risk.clone();
         let cooldown = (self.cfg.strategy.entry.cooldown_after_exit_s * 1e6) as i64;
         let mut cmds = Vec::new();
-        for book in self.books.iter_mut() {
+        let mut observe: Vec<(usize, String)> = Vec::new();
+        for (bi, book) in self.books.iter_mut().enumerate() {
             let key = format!("{}:{}:entry:{}", book.id, mint, raw.signature);
             let block = if book.entered_keys.contains(&key) {
                 Some("duplicate trigger (idempotency key already used)".to_string())
@@ -735,8 +903,12 @@ impl Engine {
                 costs: Default::default(),
                 error: None,
                 completed_us: None,
+                observed_quote: None,
+                fill_basis: None,
+                aggregator_divergence_bps: None,
             };
             book.entered_keys.insert(key);
+            observe.push((bi, order.order_id.clone()));
             book.reserved += entry_reservation(d.size_lamports, &book.scenario, &costs);
             cmds.push(StoreCmd::OrderSubmitted(Box::new(order.clone())));
             book.pending.push(order);
@@ -744,6 +916,12 @@ impl Engine {
         let _ = f;
         for c in cmds {
             self.store.send(c).await;
+        }
+        if self.mode == DataMode::Live && !observe.is_empty() {
+            self.lat("end_to_end_recv_to_order", wall_us() - raw.recv_us);
+        }
+        for (bi, oid) in observe {
+            self.spawn_jupiter(JupReq { mint, side: Side::Buy, amount: d.size_lamports, purpose: JupPurpose::ObserveOrder { book_idx: bi, order_id: oid }, sent_us: now }).await;
         }
     }
 
@@ -753,7 +931,8 @@ impl Engine {
     pub async fn process_due(&mut self, now: i64, settle: bool) {
         let exit_cfg = self.cfg.strategy.exit.clone();
         let costs = self.cfg.costs.clone();
-        let max_age = self.cfg.strategy.entry.max_state_age_ms;
+        let max_fill_age = self.cfg.strategy.entry.max_fill_state_age_ms;
+        let basis = FillBasisMode::parse(&self.cfg.fill_basis);
         let mut cmds: Vec<StoreCmd> = Vec::new();
         let mut fill_lat = Vec::new();
         for bi in 0..self.books.len() {
@@ -772,7 +951,23 @@ impl Engine {
                 let fill_ts = if self.clock.is_event_time() || settle { o.fill_at_us } else { now };
                 let st = self.universe.tokens.get(&o.mint);
                 let book = &mut self.books[bi];
-                let (outcome, ledger) = fill_order(&mut o, st, book, &self.fees, &costs, &exit_cfg, max_age, fill_ts);
+                let (outcome, ledger) = fill_order_with(&mut o, st, book, &self.fees, &costs, &exit_cfg, max_fill_age, basis, fill_ts);
+                match o.status {
+                    OrderStatus::Filled => {
+                        self.stats.fills_ok += 1;
+                        self.exec.add(&o, fill_ts);
+                    }
+                    OrderStatus::NoRoute => {
+                        if o.error.as_deref().is_some_and(|e| e.contains("stale")) {
+                            self.stats.fills_stale_state += 1;
+                        } else {
+                            self.stats.fills_no_route += 1;
+                        }
+                    }
+                    OrderStatus::Dropped => self.stats.fills_dropped += 1,
+                    OrderStatus::FailedSlippage => self.stats.fills_failed_slippage += 1,
+                    _ => {}
+                }
                 for l in ledger {
                     cmds.push(StoreCmd::Ledger(l));
                 }
@@ -956,6 +1151,7 @@ impl Engine {
                         peak_us: p.peak_us,
                         entry_liquidity_lamports: p.entry_liquidity,
                         entry_creator_sold_fraction: p.entry_creator_sold_fraction,
+                        exit_impact_bps: quote.as_ref().ok().map(|q| q.price_impact_bps),
                     };
                     if let Some((reason, urg)) = exit_signal(&f, &pv, value, &exit_cfg, now) {
                         p.exit_reason = Some(reason);
@@ -1054,8 +1250,13 @@ impl Engine {
             costs: Default::default(),
             error: None,
             completed_us: None,
+            observed_quote: None,
+            fill_basis: None,
+            aggregator_divergence_bps: None,
         };
         book.pending.push(order.clone());
+        let (mint, tokens) = (p.mint, p.tokens);
+        self.spawn_jupiter(JupReq { mint, side: Side::Sell, amount: tokens, purpose: JupPurpose::ObserveOrder { book_idx: bi, order_id: order_id.clone() }, sent_us: now }).await;
         self.store.send(StoreCmd::Position(Box::new(p.clone()))).await;
         self.store
             .send(StoreCmd::PositionEvent {
@@ -1069,10 +1270,6 @@ impl Engine {
     }
 
     // ------------------------------------------------------------------ aggregator
-
-    async fn request_coverage_quote(&mut self, mint: Pubkey, side: Side, amount: u64, now: i64) {
-        self.spawn_jupiter(JupReq { mint, side, amount, purpose: JupPurpose::Coverage, sent_us: now }).await;
-    }
 
     async fn request_exit_jupiter(&mut self, bi: usize, p: &Position, now: i64) {
         let req = JupReq {
@@ -1119,6 +1316,35 @@ impl Engine {
     pub async fn handle_control(&mut self, c: Control) -> bool {
         match c {
             Control::Shutdown => return false,
+            Control::BackfillDone(rep) => {
+                self.health.recovery_notes.push(format!("backfill: {} txs loaded in {:.0} ms", rep.transactions_loaded, rep.duration_ms));
+                self.live.backfill = Some(rep);
+            }
+            Control::PoolResolved { pool, result } => match result {
+                Ok(Some((base, quote))) => {
+                    if crate::decode::pumpfun::is_sol_quote(Some(&quote)) {
+                        self.universe.register_pool(pool, base);
+                        self.stats.pools_resolved += 1;
+                    } else {
+                        self.stats.pools_non_sol += 1;
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    // allow a later retry
+                    self.pool_reqs.remove(&pool);
+                }
+            },
+            Control::MintChecked { mint, result } => {
+                match &result {
+                    Ok(m) if m.is_safe() => self.stats.mint_checks_ok += 1,
+                    Ok(_) => self.stats.mint_checks_risky += 1,
+                    Err(_) => self.stats.mint_checks_failed += 1,
+                }
+                if let Some(st) = self.universe.tokens.get_mut(&mint) {
+                    st.mint_safety = Some(result);
+                }
+            }
             Control::Jupiter(r) => {
                 let Some(req) = self.jup_reqs.remove(&r.req_id) else { return true };
                 let now = self.now();
@@ -1140,6 +1366,13 @@ impl Engine {
                         route: r.result.as_ref().ok().map(|q| q.route.clone()),
                     }))
                     .await;
+                if let (JupPurpose::ObserveOrder { book_idx, order_id }, Ok(q)) = (&req.purpose, &r.result) {
+                    // attach only while the order is still pending (race guard)
+                    if let Some(o) = self.books.get_mut(*book_idx).and_then(|b| b.pending.iter_mut().find(|o| &o.order_id == order_id)) {
+                        o.observed_quote = Some(q.clone());
+                        self.stats.order_observations_attached += 1;
+                    }
+                }
                 if let (JupPurpose::Exit { book_idx, position_id, attempt }, Ok(q)) = (req.purpose, r.result) {
                     // Race guard: position must still be live, unchanged attempt count, no pending order.
                     let ok = self.books.get(book_idx).and_then(|b| b.positions.get(&position_id)).is_some_and(|p| {
@@ -1204,6 +1437,77 @@ impl Engine {
         }
     }
 
+    // ------------------------------------------------------------------ live helpers
+
+    async fn feed_tick(&mut self, now: i64) {
+        if let Some(gap) = self.feed_mon.evaluate(now) {
+            self.store.send(StoreCmd::ObservationGap { run_id: self.run_id.clone(), gap }).await;
+        }
+    }
+
+    async fn record_exec_check(&mut self, c: ExecutionCheck) {
+        self.store.send(StoreCmd::ExecutionCheck(Box::new(c.clone()))).await;
+        self.exec_recent.push_back(c);
+        while self.exec_recent.len() > 5_000 {
+            self.exec_recent.pop_front();
+        }
+    }
+
+    /// Forward-evaluation horizons and execution-check expiry (time driven).
+    async fn background_tick(&mut self, now: i64) {
+        if self.cfg.forward.enabled && self.fwd.pending() > 0 {
+            let base = self.cfg.scenarios.iter().find(|s| s.name == "base").cloned().unwrap_or_default();
+            let fixed = 2 * (self.cfg.costs.base_fee_lamports + base.priority_fee_lamports + base.tip_lamports);
+            for o in self.fwd.due(now, &self.universe, &self.fees, fixed) {
+                self.store.send(StoreCmd::ForwardOutcome(Box::new(o.clone()))).await;
+                self.fwd_recent.push_back(o);
+                while self.fwd_recent.len() > 20_000 {
+                    self.fwd_recent.pop_front();
+                }
+            }
+        }
+        for c in self.exec.expire(now) {
+            self.record_exec_check(c).await;
+        }
+    }
+
+    /// Live: resolve unknown PumpSwap pools and check new mints via read-only RPC.
+    async fn request_lookups(&mut self) {
+        let pending: Vec<Pubkey> = self.universe.pending_pools.drain(..).collect();
+        let (Some(rpc), Some(tx)) = (self.live.rpc.clone(), self.ctl_tx.clone()) else { return };
+        for pool in pending {
+            if !self.pool_reqs.insert(pool) {
+                continue;
+            }
+            self.stats.pools_resolution_requested += 1;
+            let (rpc, tx) = (rpc.clone(), tx.clone());
+            tokio::spawn(async move {
+                let result = match rpc.get_account(&pool.to_string()).await {
+                    Ok(Some((data, _owner))) => crate::decode::pumpswap::decode_pool_account(&data).map(|p| Some((p.base_mint, p.quote_mint))).map_err(|e| e.to_string()),
+                    Ok(None) => Ok(None),
+                    Err(e) => Err(e.to_string()),
+                };
+                let _ = tx.send(Control::PoolResolved { pool, result }).await;
+            });
+        }
+        if self.cfg.strategy.entry.require_mint_check {
+            let new_mints: Vec<Pubkey> = self.universe.tokens.values().filter(|t| t.mint_safety.is_none() && !self.mint_reqs.contains(&t.mint)).map(|t| t.mint).take(50).collect();
+            for mint in new_mints {
+                self.mint_reqs.insert(mint);
+                self.stats.mint_checks_requested += 1;
+                let (rpc, tx) = (rpc.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let result = match rpc.get_account(&mint.to_string()).await {
+                        Ok(Some((data, owner))) => crate::safety::check_mint(&data, &owner),
+                        Ok(None) => Err("mint account not found".into()),
+                        Err(e) => Err(e.to_string()),
+                    };
+                    let _ = tx.send(Control::MintChecked { mint, result }).await;
+                });
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ snapshot
 
     pub fn snapshot(&self) -> Snapshot {
@@ -1232,6 +1536,10 @@ impl Engine {
                     open_positions: open,
                     pending_orders: b.pending.len(),
                     perf: perf(&b.closed),
+                    perf_by_path: ["launch", "momentum"]
+                        .iter()
+                        .map(|k| (k.to_string(), perf(&b.closed.iter().filter(|p| p.path.as_str() == *k).cloned().collect::<Vec<_>>())))
+                        .collect(),
                     accounting_ok: acct.is_ok(),
                     accounting_error: acct.err(),
                 }
@@ -1245,6 +1553,25 @@ impl Engine {
         cands.truncate(150);
         let store = &self.store.stats;
         Snapshot {
+            feed_status: if self.mode == DataMode::Live { Some(self.feed_mon.status(now)) } else { None },
+            providers: self.feed_mon.providers.clone(),
+            rpc_endpoints: self.live.rpc.as_ref().map(|r| r.stats()).unwrap_or_default(),
+            tx_fetch: self.live.fetch_stats.as_ref().map(|f| f.snapshot()),
+            backfill: self.live.backfill.clone(),
+            forward_summary: crate::forward::summarize(&self.fwd_recent),
+            forward_pending: self.fwd.pending(),
+            execution_quality: crate::execcheck::summarize(&self.exec_recent),
+            recent_execution_checks: self.exec_recent.iter().rev().take(50).cloned().collect(),
+            decoder_verification: crate::decode::verification(),
+            counters: EngineCounters {
+                pools_resolved: self.universe.pools_resolved,
+                ..self.stats.clone()
+            },
+            status_banner: match self.mode {
+                DataMode::Live => format!("LIVE DATA / PAPER TRADING — feed {:?}", self.feed_mon.state()),
+                DataMode::Fixture => "OFFLINE FIXTURE / PAPER TRADING".into(),
+                DataMode::Replay => "REPLAY / PAPER TRADING".into(),
+            },
             generated_us: now,
             paper_only: true,
             data_mode: Some(self.mode),
@@ -1290,6 +1617,8 @@ impl Engine {
         if !self.clock.is_event_time() {
             self.process_due(now, false).await;
             self.check_all_positions(now).await;
+            self.feed_tick(now).await;
+            self.background_tick(now).await;
         }
         self.publish(false);
     }
@@ -1313,6 +1642,9 @@ impl Engine {
                 },
                 _ = tick.tick() => self.tick().await,
             }
+        }
+        if let Some(gap) = self.feed_mon.close(self.now()) {
+            self.store.send(StoreCmd::ObservationGap { run_id: self.run_id.clone(), gap }).await;
         }
         self.store.flush().await;
         self.publish(true);

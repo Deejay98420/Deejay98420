@@ -44,6 +44,35 @@ impl VenueEvent {
     }
 }
 
+/// Verification status of each decoded layout (shown on the dashboard and in docs).
+#[derive(Clone, Debug, Serialize)]
+pub struct Verification {
+    pub venue: &'static str,
+    pub item: &'static str,
+    pub status: &'static str,
+    pub evidence: &'static str,
+}
+
+pub fn verification() -> Vec<Verification> {
+    const PUMP: &str = "official IDL @pump-fun/pump-sdk@4.0.0 (tests/idl_verification.rs); math vs SDK bondingCurve.ts";
+    const AMM: &str = "official IDL @pump-fun/pump-swap-sdk@2.1.0 (tests/idl_verification.rs); math vs SDK buy.ts/sell.ts";
+    let mut v = Vec::new();
+    for e in ["CreateEvent", "TradeEvent", "CompleteEvent", "CompletePumpAmmMigrationEvent", "BondingCurve account"] {
+        v.push(Verification { venue: "pump_bonding_curve", item: e, status: "idl_verified", evidence: PUMP });
+    }
+    for e in ["CreatePoolEvent", "BuyEvent", "SellEvent", "DepositEvent", "WithdrawEvent", "Pool account"] {
+        v.push(Verification { venue: "pumpswap", item: e, status: "idl_verified", evidence: AMM });
+    }
+    v.push(Verification { venue: "raydium_amm_v4", item: "ray_log", status: "unverified", evidence: "layout from public program source knowledge; decode-only, never traded" });
+    v.push(Verification {
+        venue: "all",
+        item: "captured mainnet transactions",
+        status: "pending",
+        evidence: "run `sniper capture` with RPC access; fixtures/real/ is checked by tests/real_fixtures.rs",
+    });
+    v
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Decoded {
     /// Index within the transaction (log/inner-ix order) — together with the signature this is a unique id.

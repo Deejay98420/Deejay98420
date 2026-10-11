@@ -52,6 +52,12 @@ pub enum RejectReason {
     AlreadyPositioned,
     Cooldown { remaining_s: f64 },
     RiskLimit { detail: String },
+    FeedUnhealthy { state: String, reasons: Vec<String> },
+    MintUnchecked { detail: String },
+    MintRisk { risks: Vec<String> },
+    NonSolQuote,
+    InsufficientEdge { expected_move_bps: f64, round_trip_cost_bps: f64, edge_bps: f64, min_bps: f64 },
+    LiquidityUnstable { stability: f64, min: f64 },
 }
 
 impl RejectReason {

@@ -45,7 +45,23 @@ pub struct CurveReserves {
 pub struct PoolReserves {
     pub pool: Pubkey,
     pub base: u64,
+    /// quote vault balance (real quote available for sells/withdrawals)
     pub quote: u64,
+    /// PumpSwap `virtual_quote_reserves` (signed); pricing uses quote + virtual (SDK)
+    pub virtual_quote: i128,
+    /// fee rates observed on the latest swap event
+    #[serde(skip)]
+    pub fees: Option<crate::quote::math::AmmFees>,
+}
+
+impl PoolReserves {
+    pub fn new(pool: Pubkey, base: u64, quote: u64) -> Self {
+        Self { pool, base, quote, virtual_quote: 0, fees: None }
+    }
+    /// Effective quote reserve used for pricing.
+    pub fn quote_eff(&self) -> u64 {
+        (self.quote as i128 + self.virtual_quote).clamp(0, u64::MAX as i128) as u64
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -59,6 +75,8 @@ pub struct TradeObs {
     /// lamports per raw token unit after the trade (marginal)
     pub price_after: f64,
     pub venue: Venue,
+    /// Quote the trader actually paid (buys, incl. fees) or received (sells, after fees), lamports.
+    pub user_quote: u64,
 }
 
 /// One state input, retained for rollback recomputation.
@@ -107,6 +125,18 @@ pub struct TokenState {
     pub rolled_back_slots: u32,
     /// Total curve fee bps (protocol + creator) observed on the most recent trade event, if reported.
     pub observed_curve_fee_bps: Option<u64>,
+    /// Fee components observed on the most recent trade event.
+    #[serde(skip)]
+    pub curve_fees: Option<crate::quote::math::CurveFees>,
+    /// Curve or pool quoted in a non-SOL mint: never traded (amounts are not lamports).
+    pub quote_non_sol: bool,
+    /// Result of the on-chain mint check (live mode), if performed.
+    pub mint_safety: Option<Result<crate::safety::MintSafety, String>>,
+    /// Inputs that arrived older than the newest applied slot (backfill / reordering): analytics only.
+    pub out_of_order_inputs: u32,
+    /// (ts, liquidity lamports) after each applied input, bounded
+    #[serde(skip)]
+    pub liq_samples: VecDeque<(i64, u64)>,
     #[serde(skip)]
     pub inputs: VecDeque<Input>,
 }
@@ -141,11 +171,19 @@ impl TokenState {
             non_creator_sell_seen: false,
             rolled_back_slots: 0,
             observed_curve_fee_bps: None,
+            curve_fees: None,
+            quote_non_sol: false,
+            mint_safety: None,
+            out_of_order_inputs: 0,
+            liq_samples: VecDeque::new(),
             inputs: VecDeque::new(),
         }
     }
 
     pub fn venue(&self) -> Option<Venue> {
+        if self.quote_non_sol {
+            return None;
+        }
         match self.phase {
             Phase::BondingCurve if self.curve.is_some() => Some(Venue::PumpBondingCurve),
             Phase::Amm if self.pool.is_some() => Some(Venue::PumpSwap),
@@ -155,6 +193,9 @@ impl TokenState {
 
     /// SOL actually backing the price on the current venue (lamports).
     pub fn liquidity_lamports(&self) -> u64 {
+        if self.quote_non_sol {
+            return 0;
+        }
         match self.phase {
             Phase::BondingCurve => self.curve.map(|c| c.real_sol).unwrap_or(0),
             Phase::AwaitingMigration => 0,
@@ -166,7 +207,7 @@ impl TokenState {
     pub fn marginal_price(&self) -> Option<f64> {
         match self.phase {
             Phase::BondingCurve => self.curve.filter(|c| c.virtual_token > 0).map(|c| c.virtual_sol as f64 / c.virtual_token as f64),
-            Phase::Amm => self.pool.filter(|p| p.base > 0).map(|p| p.quote as f64 / p.base as f64),
+            Phase::Amm => self.pool.filter(|p| p.base > 0).map(|p| p.quote_eff() as f64 / p.base as f64),
             Phase::AwaitingMigration => None,
         }
     }
@@ -206,10 +247,19 @@ impl TokenState {
         self.last_slot = self.last_slot.max(input.slot);
         let liq = self.liquidity_lamports();
         self.peak_liquidity_lamports = self.peak_liquidity_lamports.max(liq);
+        self.liq_samples.push_back((input.ts_us, liq));
+        while self.liq_samples.len() > 600 {
+            self.liq_samples.pop_front();
+        }
     }
 
     /// Apply one input. Returns false if the event does not concern this token.
     pub fn apply(&mut self, input: &Input) -> bool {
+        // Absolute-reserve events older than what we already applied would move state backwards.
+        if self.last_slot > 0 && input.slot < self.last_slot {
+            self.out_of_order_inputs += 1;
+            return self.apply_analytics_only(input);
+        }
         match &input.event {
             VenueEvent::Pump(PumpEvent::Create(c)) => {
                 self.name = Some(c.name.clone());
@@ -218,6 +268,9 @@ impl TokenState {
                 self.created_us = Some(c.timestamp.map(|t| t * 1_000_000).unwrap_or(input.ts_us));
                 self.create_slot = Some(input.slot);
                 self.origin = Origin::Launch;
+                if !crate::decode::pumpfun::is_sol_quote(c.quote_mint().as_ref()) {
+                    self.quote_non_sol = true;
+                }
                 if let Some(s) = c.token_total_supply {
                     self.total_supply = s;
                 }
@@ -248,8 +301,12 @@ impl TokenState {
                 } else {
                     0.0
                 };
-                if let Some(f) = t.fee_basis_points {
-                    self.observed_curve_fee_bps = Some(f + t.creator_fee_basis_points.unwrap_or(0));
+                if !t.is_sol_quoted() {
+                    self.quote_non_sol = true;
+                }
+                if let (Some(total), Some(p)) = (t.total_fee_bps(), t.fee_basis_points) {
+                    self.observed_curve_fee_bps = Some(total);
+                    self.curve_fees = Some(crate::quote::math::CurveFees { protocol_bps: p, creator_bps: total - p });
                 }
                 if self.creator.is_none() {
                     if let Some(c) = t.creator {
@@ -265,6 +322,11 @@ impl TokenState {
                     tokens: t.token_amount,
                     price_after: price,
                     venue: Venue::PumpBondingCurve,
+                    // curve events report net SOL; buys pay fees on top, sells receive net of fees
+                    user_quote: {
+                        let fees = t.fee.unwrap_or(0) + t.creator_fee.unwrap_or(0);
+                        if t.is_buy { t.sol_amount + fees } else { t.sol_amount.saturating_sub(fees) }
+                    },
                 });
             }
             VenueEvent::Pump(PumpEvent::Complete(_)) => {
@@ -274,12 +336,12 @@ impl TokenState {
             }
             VenueEvent::Pump(PumpEvent::Migration(m)) => {
                 if self.pool.is_none() {
-                    self.pool = Some(PoolReserves { pool: m.pool, base: m.mint_amount, quote: m.sol_amount });
+                    self.pool = Some(PoolReserves::new(m.pool, m.mint_amount, m.sol_amount));
                 }
                 self.phase = Phase::Amm;
             }
             VenueEvent::PumpSwap(PumpSwapEvent::CreatePool(c)) => {
-                self.pool = Some(PoolReserves { pool: c.pool, base: c.pool_base_amount, quote: c.pool_quote_amount });
+                self.pool = Some(PoolReserves::new(c.pool, c.pool_base_amount, c.pool_quote_amount));
                 self.phase = Phase::Amm;
                 if self.creator.is_none() {
                     self.creator = Some(c.creator);
@@ -297,7 +359,19 @@ impl TokenState {
                         s.pool_quote_token_reserves.saturating_sub(s.quote_amount_pool),
                     )
                 };
-                self.pool = Some(PoolReserves { pool: s.pool, base, quote });
+                let fees = crate::quote::math::AmmFees {
+                    lp_bps: s.lp_fee_bps,
+                    protocol_bps: s.protocol_fee_bps,
+                    creator_bps: s.total_fee_bps() - s.lp_fee_bps - s.protocol_fee_bps,
+                };
+                let prev_virtual = self.pool.map(|p| p.virtual_quote).unwrap_or(0);
+                self.pool = Some(PoolReserves {
+                    pool: s.pool,
+                    base,
+                    quote,
+                    virtual_quote: s.virtual_quote_reserves.unwrap_or(prev_virtual),
+                    fees: if s.lp_fee_bps + s.protocol_fee_bps > 0 { Some(fees) } else { self.pool.and_then(|p| p.fees) },
+                });
                 self.phase = Phase::Amm;
                 self.record_trade(TradeObs {
                     ts_us: input.ts_us,
@@ -306,8 +380,9 @@ impl TokenState {
                     is_buy: s.is_buy,
                     sol: s.quote_amount_user,
                     tokens: s.base_amount,
-                    price_after: if base > 0 { quote as f64 / base as f64 } else { 0.0 },
+                    price_after: self.pool.filter(|p| p.base > 0).map(|p| p.quote_eff() as f64 / p.base as f64).unwrap_or(0.0),
                     venue: Venue::PumpSwap,
+                    user_quote: s.quote_amount_user,
                 });
             }
             VenueEvent::PumpSwap(PumpSwapEvent::Liquidity(l)) => {
@@ -320,12 +395,52 @@ impl TokenState {
                         l.pool_quote_token_reserves.saturating_sub(l.quote_amount),
                     )
                 };
-                self.pool = Some(PoolReserves { pool: l.pool, base, quote });
+                let prev = self.pool;
+                self.pool = Some(PoolReserves {
+                    pool: l.pool,
+                    base,
+                    quote,
+                    virtual_quote: prev.map(|p| p.virtual_quote).unwrap_or(0),
+                    fees: prev.and_then(|p| p.fees),
+                });
                 self.phase = Phase::Amm;
             }
             VenueEvent::Raydium(_) => return false,
         }
         self.touch(input);
+        true
+    }
+
+    /// Record flow analytics for an out-of-order trade without touching reserves.
+    fn apply_analytics_only(&mut self, input: &Input) -> bool {
+        let obs = match &input.event {
+            VenueEvent::Pump(PumpEvent::Trade(t)) => TradeObs {
+                ts_us: input.ts_us,
+                slot: input.slot,
+                user: t.user,
+                is_buy: t.is_buy,
+                sol: t.sol_amount,
+                tokens: t.token_amount,
+                price_after: if t.virtual_token_reserves > 0 { t.virtual_sol_reserves as f64 / t.virtual_token_reserves as f64 } else { 0.0 },
+                venue: Venue::PumpBondingCurve,
+                user_quote: t.sol_amount,
+            },
+            VenueEvent::PumpSwap(PumpSwapEvent::Swap(s)) => TradeObs {
+                ts_us: input.ts_us,
+                slot: input.slot,
+                user: s.user,
+                is_buy: s.is_buy,
+                sol: s.quote_amount_user,
+                tokens: s.base_amount,
+                price_after: 0.0,
+                venue: Venue::PumpSwap,
+                user_quote: s.quote_amount_user,
+            },
+            _ => return true,
+        };
+        self.record_trade(obs);
+        // keep the deque time-ordered for window analytics
+        self.trades.make_contiguous().sort_by_key(|t| t.ts_us);
         true
     }
 
@@ -367,6 +482,10 @@ pub struct Universe {
     pub pool_to_mint: HashMap<Pubkey, Pubkey>,
     pub slot_mints: HashMap<u64, HashSet<Pubkey>>,
     pub unresolved_pool_events: u64,
+    /// pools seen in swaps but not yet mapped to a mint (drained by the engine for RPC lookup)
+    pub pending_pools: Vec<Pubkey>,
+    pub pools_resolved: u64,
+    pub non_sol_curves_seen: u64,
     pub non_sol_pools_ignored: u64,
     pub raydium_decode_only: u64,
     pub max_tokens: usize,
@@ -399,6 +518,9 @@ impl Universe {
                 Some(m) => Some((*m, Change::Trade { is_buy: s.is_buy }, Some(s.user))),
                 None => {
                     self.unresolved_pool_events += 1;
+                    if !self.pending_pools.contains(&s.pool) && self.pending_pools.len() < 10_000 {
+                        self.pending_pools.push(s.pool);
+                    }
                     None
                 }
             },
@@ -422,7 +544,9 @@ impl Universe {
 
     /// Register an externally resolved pool (e.g. RPC pool-account lookup in live mode).
     pub fn register_pool(&mut self, pool: Pubkey, mint: Pubkey) {
-        self.pool_to_mint.insert(pool, mint);
+        if self.pool_to_mint.insert(pool, mint).is_none() {
+            self.pools_resolved += 1;
+        }
     }
 
     pub fn apply(&mut self, input: Input) -> Option<Applied> {

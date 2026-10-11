@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
 
 fn ev(sig: &str, c: Commitment) -> StreamMsg {
-    StreamMsg::Event(RawEvent { provider: "t".into(), data_mode: DataMode::Fixture, slot: 1, signature: sig.into(), commitment: c, err: None, logs: vec![], inner_ix: vec![], block_time: None, recv_us: 0 })
+    StreamMsg::Event(RawEvent { provider: "t".into(), data_mode: DataMode::Fixture, slot: 1, signature: sig.into(), commitment: c, err: None, logs: vec![], inner_ix: vec![], block_time: None, recv_us: 0, backfill: false, fetch_us: None })
 }
 
 #[test]
@@ -121,6 +121,8 @@ async fn ws_source_reconnects_and_resubscribes() {
         idle_timeout: Duration::from_millis(250),
         ping_interval: Duration::from_secs(10),
         backoff: Backoff::new(20, 100, Some(10)),
+        tip: false,
+        slot_updates: false,
     };
     let task = tokio::spawn(ws::run(cfg, ing.clone()));
     let mut sigs = Vec::new();
@@ -158,6 +160,8 @@ async fn ws_source_reports_exhaustion() {
         idle_timeout: Duration::from_millis(100),
         ping_interval: Duration::from_secs(10),
         backoff: Backoff::new(5, 10, Some(2)),
+        tip: false,
+        slot_updates: false,
     };
     ws::run(cfg, ing).await;
     let mut last = None;

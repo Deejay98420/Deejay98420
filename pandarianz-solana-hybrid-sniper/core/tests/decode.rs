@@ -11,7 +11,7 @@ use sniper_core::stream::{ws, RawEvent};
 use sniper_core::types::{programs, Commitment, DataMode, Pubkey};
 
 fn raw(logs: Vec<String>, inner: Vec<sniper_core::stream::InnerIx>, err: Option<String>) -> RawEvent {
-    RawEvent { provider: "t".into(), data_mode: DataMode::Fixture, slot: 1, signature: "s".into(), commitment: Commitment::Confirmed, err, logs, inner_ix: inner, block_time: None, recv_us: 0 }
+    RawEvent { provider: "t".into(), data_mode: DataMode::Fixture, slot: 1, signature: "s".into(), commitment: Commitment::Confirmed, err, logs, inner_ix: inner, block_time: None, recv_us: 0, backfill: false, fetch_us: None }
 }
 
 #[test]
@@ -50,6 +50,7 @@ fn legacy_trade_event_without_trailing_fields_decodes() {
         creator: None,
         creator_fee_basis_points: None,
         creator_fee: None,
+        tail: None,
     };
     let out = decode_raw(&raw(build::pump_logs(&[PumpEvent::Trade(t.clone())]), vec![], None));
     assert_eq!(out.events[0].event, VenueEvent::Pump(PumpEvent::Trade(t)));

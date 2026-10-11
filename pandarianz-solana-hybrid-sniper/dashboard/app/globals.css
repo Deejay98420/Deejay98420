@@ -98,3 +98,9 @@ td.num, th.num { text-align: right; }
 .tooltip { position: absolute; pointer-events: none; background: var(--text); color: var(--bg); padding: 6px 8px; border-radius: 6px; font-size: 12px; white-space: nowrap; transform: translate(-50%, -110%); }
 .err { color: var(--critical); font-weight: 600; }
 footer { margin: 16px 0; color: var(--muted); font-size: 12px; }
+
+.badge.feed-HEALTHY { background: var(--live-bg); color: var(--live-fg); border-color: var(--live-fg); }
+.badge.feed-DEGRADED { background: var(--fixture-bg); color: var(--fixture-fg); border-color: var(--fixture-fg); }
+.badge.feed-DOWN { background: var(--critical); color: #fff; }
+.note.DOWN { border-color: var(--critical); color: var(--critical); }
+.note.LIVE { background: var(--live-bg); color: var(--live-fg); border-color: var(--live-fg); }

@@ -86,6 +86,17 @@ pub struct EntryCommon {
     pub cooldown_after_exit_s: f64,
     pub min_eval_interval_ms: f64,
     pub min_score: f64,
+    /// live mode: require an on-chain mint check (freeze authority / Token-2022 extensions) before entry
+    pub require_mint_check: bool,
+    /// no paper fill against token state older than this (no invented fills on stale data)
+    pub max_fill_state_age_ms: f64,
+    /// heuristic expected move at score 1.0 (bps). UNCALIBRATED prior — calibrate with forward evaluation.
+    pub expected_move_scale_bps: f64,
+    /// required (expected move − estimated round-trip cost), bps
+    pub min_net_edge_bps: f64,
+    /// 1 − (worst 60s liquidity drawdown) below this → unstable
+    pub min_liquidity_stability: f64,
+    pub block_entries_when_feed_unhealthy: bool,
 }
 impl Default for EntryCommon {
     fn default() -> Self {
@@ -101,6 +112,12 @@ impl Default for EntryCommon {
             cooldown_after_exit_s: 600.0,
             min_eval_interval_ms: 750.0,
             min_score: 0.45,
+            require_mint_check: true,
+            max_fill_state_age_ms: 15_000.0,
+            expected_move_scale_bps: 2_500.0,
+            min_net_edge_bps: 150.0,
+            min_liquidity_stability: 0.75,
+            block_entries_when_feed_unhealthy: true,
         }
     }
 }
@@ -131,6 +148,10 @@ pub struct ExitPolicy {
     pub unresolved_after_s: f64,
     pub unresolved_retry_interval_s: f64,
     pub model_own_impact: bool,
+    /// in profit after costs and 10s buy ratio below this with negative 10s net flow → lock gains
+    pub fade_buy_ratio_10s: f64,
+    /// exit-quote price impact above this → sellability concern, exit now
+    pub max_exit_impact_bps: f64,
 }
 impl Default for ExitPolicy {
     fn default() -> Self {
@@ -156,6 +177,8 @@ impl Default for ExitPolicy {
             unresolved_after_s: 120.0,
             unresolved_retry_interval_s: 30.0,
             model_own_impact: true,
+            fade_buy_ratio_10s: 0.40,
+            max_exit_impact_bps: 1_500.0,
         }
     }
 }
@@ -300,6 +323,25 @@ pub struct EngineConfig {
     pub dedup_window: usize,
     pub tick_ms: u64,
     pub feed_buffer: usize,
+    pub feed_health: crate::feed::FeedConfig,
+    pub forward: ForwardConfig,
+    /// observed-execution comparison window after each simulated fill
+    pub exec_check_window_s: f64,
+    /// "conservative" (min of venue simulation and a fresh Jupiter observation) or "venue_sim"
+    pub fill_basis: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ForwardConfig {
+    pub enabled: bool,
+    pub probe_lamports: u64,
+    pub horizons_s: Vec<u32>,
+}
+impl Default for ForwardConfig {
+    fn default() -> Self {
+        Self { enabled: true, probe_lamports: 50_000_000, horizons_s: vec![30, 120, 300] }
+    }
 }
 impl Default for EngineConfig {
     fn default() -> Self {
@@ -313,6 +355,10 @@ impl Default for EngineConfig {
             dedup_window: 200_000,
             tick_ms: 250,
             feed_buffer: 300,
+            feed_health: crate::feed::FeedConfig::default(),
+            forward: ForwardConfig::default(),
+            exec_check_window_s: 5.0,
+            fill_basis: "conservative".into(),
         }
     }
 }

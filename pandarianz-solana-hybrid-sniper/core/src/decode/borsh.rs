@@ -58,6 +58,18 @@ impl<'a> Reader<'a> {
     pub fn u64(&mut self) -> Result<u64, DecodeError> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
+    pub fn i128(&mut self) -> Result<i128, DecodeError> {
+        Ok(i128::from_le_bytes(self.take(16)?.try_into().unwrap()))
+    }
+    pub fn u128(&mut self) -> Result<u128, DecodeError> {
+        Ok(u128::from_le_bytes(self.take(16)?.try_into().unwrap()))
+    }
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+    pub fn skip(&mut self, n: usize) -> Result<(), DecodeError> {
+        self.take(n).map(|_| ())
+    }
     pub fn i64(&mut self) -> Result<i64, DecodeError> {
         Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
@@ -107,6 +119,15 @@ impl Writer {
         self.bytes(&v.to_le_bytes())
     }
     pub fn u64(&mut self, v: u64) -> &mut Self {
+        self.bytes(&v.to_le_bytes())
+    }
+    pub fn i128(&mut self, v: i128) -> &mut Self {
+        self.bytes(&v.to_le_bytes())
+    }
+    pub fn u16v(&mut self, v: u16) -> &mut Self {
+        self.bytes(&v.to_le_bytes())
+    }
+    pub fn u32(&mut self, v: u32) -> &mut Self {
         self.bytes(&v.to_le_bytes())
     }
     pub fn i64(&mut self, v: i64) -> &mut Self {

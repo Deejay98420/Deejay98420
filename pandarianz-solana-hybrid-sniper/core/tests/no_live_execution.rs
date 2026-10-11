@@ -100,3 +100,25 @@ fn env_example_has_placeholders_only() {
         assert!(!v.contains("api-key=") || v.contains("<"), "{k} embeds a real-looking key");
     }
 }
+
+#[test]
+fn shipped_strategy_config_parses_and_every_key_takes_effect() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let text = std::fs::read_to_string(root.join("config/strategy.toml")).unwrap();
+    let cfg: sniper_core::config::EngineConfig = toml::from_str(&text).unwrap();
+    // round-trip: every key in the file must exist in the effective config (no silently ignored keys)
+    let file: toml::Value = toml::from_str(&text).unwrap();
+    let eff = toml::Value::try_from(&cfg).unwrap();
+    fn walk(path: &str, f: &toml::Value, e: &toml::Value) {
+        if let (toml::Value::Table(ft), toml::Value::Table(et)) = (f, e) {
+            for (k, v) in ft {
+                let p = format!("{path}.{k}");
+                let ev = et.get(k).unwrap_or_else(|| panic!("config key {p} is not used by the engine"));
+                walk(&p, v, ev);
+            }
+        }
+    }
+    walk("", &file, &eff);
+    assert_eq!(cfg.fill_basis, "conservative");
+    assert!(cfg.strategy.entry.require_mint_check);
+}

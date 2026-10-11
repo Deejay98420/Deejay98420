@@ -6,9 +6,9 @@ use sniper_core::config::EngineConfig;
 use sniper_core::engine::{Control, Engine, EngineOptions, Snapshot};
 use sniper_core::quote::jupiter::{JupiterClient, JupiterConfig};
 use sniper_core::store::{self, pg::PgStore, MemData, Recovered};
-use sniper_core::stream::{backoff::Backoff, fixture, ws, Ingestor};
+use sniper_core::stream::{fixture, Ingestor};
 use sniper_core::time::wall_us;
-use sniper_core::types::{programs, sol, Commitment, DataMode};
+use sniper_core::types::{programs, sol, DataMode};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -57,7 +57,26 @@ enum Cmd {
     },
     /// Write deterministic synthetic fixtures.
     GenFixtures {
-        #[arg(long, default_value = "../fixtures")]
+        #[arg(long, default_value = "../fixtures/synthetic")]
+        out: PathBuf,
+    },
+    /// Connect to the configured live providers for N seconds (memory store, no trading decisions are
+    /// persisted) and write a validation report: connectivity, decode coverage, latency, feed health.
+    VerifyLive {
+        #[arg(long, default_value_t = 120)]
+        seconds: u64,
+        #[arg(long, default_value = "../reports")]
+        out: PathBuf,
+    },
+    /// Capture real mainnet transactions (read-only getTransaction) as regression fixtures.
+    Capture {
+        /// comma-separated signatures to capture
+        #[arg(long, value_delimiter = ',')]
+        signatures: Vec<String>,
+        /// or: sample N recent signatures per supported program
+        #[arg(long)]
+        from_live: Option<usize>,
+        #[arg(long, default_value = "../fixtures/real")]
         out: PathBuf,
     },
     /// Re-run a recorded journal (PostgreSQL) through the current strategy as REPLAY data.
@@ -97,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::GenFixtures { out } => {
             std::fs::create_dir_all(&out)?;
-            let p = out.join("hybrid_session.jsonl");
+            let p = out.join("hybrid_session.jsonl"); // synthetic fixtures live in fixtures/synthetic
             let msgs = sniper_core::fixtures::hybrid_session();
             std::fs::write(&p, sniper_core::fixtures::to_jsonl(&msgs))?;
             println!("wrote {} synthetic messages to {}", msgs.len(), p.display());
@@ -137,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
                     e.into_stream_msg()
                 })
                 .collect();
-            let snap = run_engine(cfg, DataMode::Replay, profile_key, StoreKind::Postgres, None, false, msgs, None).await?;
+            let snap = run_engine(cfg, DataMode::Replay, profile_key, StoreKind::Postgres, None, false, msgs, None, None).await?;
             print_summary(&snap);
             Ok(())
         }
@@ -145,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
             let cfg = EngineConfig::load(config.as_deref())?;
             match mode {
                 Mode::Fixture => {
-                    let default = PathBuf::from("../fixtures/hybrid_session.jsonl");
+                    let default = PathBuf::from("../fixtures/synthetic/hybrid_session.jsonl");
                     let msgs = match fixture {
                         Some(p) => fixture::load_jsonl(&p, DataMode::Fixture)?,
                         None if default.exists() => fixture::load_jsonl(&default, DataMode::Fixture)?,
@@ -153,38 +172,34 @@ async fn main() -> anyhow::Result<()> {
                     };
                     let profile = profile.unwrap_or_else(|| format!("run{}", wall_us() / 1_000_000));
                     let key = format!("FIXTURE:{profile}");
-                    let snap = run_engine(cfg, DataMode::Fixture, key, store, Some(api), hold, msgs, None).await?;
+                    let snap = run_engine(cfg, DataMode::Fixture, key, store, Some(api), hold, msgs, None, None).await?;
                     print_summary(&snap);
                     Ok(())
                 }
                 Mode::Live => {
-                    let url = std::env::var("SOLANA_WS_URL").ok().filter(|s| !s.trim().is_empty());
-                    let Some(url) = url else {
-                        bail!("LIVE mode blocked: SOLANA_WS_URL is not set. Provide a provider WebSocket URL in .env, or use --mode fixture.");
-                    };
-                    let kind = match std::env::var("SOLANA_STREAM_KIND").unwrap_or_default().as_str() {
-                        "transactions" => ws::SubscriptionKind::Transactions {
-                            account_include: vec![programs::PUMP_FUN.into(), programs::PUMP_SWAP.into()],
-                        },
-                        _ => ws::SubscriptionKind::Logs { mentions: vec![programs::PUMP_FUN.into(), programs::PUMP_SWAP.into(), programs::RAYDIUM_AMM_V4.into()] },
-                    };
-                    let wscfg = ws::WsConfig {
-                        provider: std::env::var("SOLANA_PROVIDER_NAME").unwrap_or_else(|_| "rpc-ws".into()),
-                        url,
-                        kind,
-                        commitment: Commitment::Confirmed,
-                        idle_timeout: Duration::from_secs(45),
-                        ping_interval: Duration::from_secs(15),
-                        backoff: Backoff::new(250, 15_000, None),
-                    };
+                    let setup = sniper_core::live::LiveSetup::from_env()?;
                     let profile = profile.unwrap_or_else(|| "main".into());
                     let key = format!("LIVE:{profile}");
-                    let snap = run_engine(cfg, DataMode::Live, key, store, Some(api), true, vec![], Some(wscfg)).await?;
+                    let snap = run_engine(cfg, DataMode::Live, key, store, Some(api), true, vec![], Some(setup), None).await?;
                     print_summary(&snap);
                     Ok(())
                 }
             }
         }
+        Cmd::VerifyLive { seconds, out } => {
+            let setup = sniper_core::live::LiveSetup::from_env()?;
+            let cfg = EngineConfig::default();
+            let key = format!("LIVE:verify{}", wall_us() / 1_000_000);
+            let snap = run_engine(cfg, DataMode::Live, key, StoreKind::Memory, None, true, vec![], Some(setup), Some(Duration::from_secs(seconds))).await?;
+            let report = live_report(&snap, seconds);
+            std::fs::create_dir_all(&out)?;
+            let path = out.join(format!("live-validation-{}.json", wall_us() / 1_000_000));
+            std::fs::write(&path, serde_json::to_string_pretty(&report)?)?;
+            println!("{}", serde_json::to_string_pretty(&report["verdict"])?);
+            println!("full report: {}", path.display());
+            Ok(())
+        }
+        Cmd::Capture { signatures, from_live, out } => capture(signatures, from_live, out).await,
     }
 }
 
@@ -197,7 +212,8 @@ async fn run_engine(
     api: Option<String>,
     hold: bool,
     fixture_msgs: Vec<sniper_core::stream::StreamMsg>,
-    ws_cfg: Option<ws::WsConfig>,
+    live: Option<sniper_core::live::LiveSetup>,
+    stop_after: Option<Duration>,
 ) -> anyhow::Result<Snapshot> {
     let run_id = format!("r{}", wall_us());
     let (store, rec, warm) = match store_kind {
@@ -230,6 +246,12 @@ async fn run_engine(
     let opts = EngineOptions { data_mode: mode, profile_key: profile_key.clone(), run_id, jupiter, ingest_stats: Some(ingestor.clone()) };
     let cfg_json = serde_json::to_value(&cfg)?;
     let mut engine = Engine::new(cfg, opts, store, Some(rec));
+    let rpc = match &live {
+        Some(l) => l.rpc()?,
+        None => None,
+    };
+    let fetch_stats = Arc::new(sniper_core::live::FetchStats::default());
+    engine.live = sniper_core::engine::LiveServices { rpc: rpc.clone(), fetch_stats: Some(fetch_stats.clone()), backfill: None };
     engine.warmup(&warm);
     engine.boot(cfg_json).await;
     engine.exit_on_end = !hold;
@@ -246,10 +268,10 @@ async fn run_engine(
     let (ctl_tx, ctl_rx) = mpsc::channel(1024);
     engine.set_control_sender(ctl_tx.clone());
     tracing::info!(profile = %profile_key, mode = mode.as_str(), version = %engine.version, "engine starting (PAPER ONLY)");
-    match ws_cfg {
-        Some(w) => {
-            let ing = ingestor.clone();
-            tokio::spawn(ws::run(w, ing));
+    match live {
+        Some(setup) => {
+            tracing::info!(providers = setup.ws.len(), rpc_endpoints = setup.rpc_urls.len(), "starting live sources (read-only)");
+            sniper_core::live::start_sources(setup, rpc, ingestor.clone(), ctl_tx.clone(), fetch_stats);
         }
         None => {
             let ing = ingestor.clone();
@@ -259,6 +281,13 @@ async fn run_engine(
                 }
             });
         }
+    }
+    if let Some(d) = stop_after {
+        let stop = ctl_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(d).await;
+            let _ = stop.send(Control::Shutdown).await;
+        });
     }
     let stop = ctl_tx.clone();
     tokio::spawn(async move {
@@ -329,7 +358,39 @@ async fn report(profile: &str, json: bool) -> anyhow::Result<()> {
         .client
         .query("select kind, status, count(*) from orders where profile_key=$1 group by 1,2 order by 1,2", &[&profile])
         .await?;
+    let fwd = pg
+        .client
+        .query(
+            "select path, decision, horizon_s, count(*), count(net_return), avg(net_return), avg((net_return > 0)::int::float8)
+             from forward_outcomes where profile_key=$1 group by 1,2,3 order by 1,2,3",
+            &[&profile],
+        )
+        .await?;
+    let exec = pg
+        .client
+        .query(
+            "select count(*), count(adverse_bps), percentile_cont(0.5) within group (order by adverse_bps), avg(adverse_bps)
+             from execution_checks where profile_key=$1",
+            &[&profile],
+        )
+        .await?;
+    let gaps = pg
+        .client
+        .query("select count(*), coalesce(sum(coalesce(end_us, start_us) - start_us),0)::bigint from observation_gaps where profile_key=$1", &[&profile])
+        .await?;
     let mut out = serde_json::json!({"profile_key": profile, "paper_only": true, "books": []});
+    out["forward_evaluation"] = fwd
+        .iter()
+        .map(|r| {
+            serde_json::json!({"path": r.get::<_, String>(0), "decision": r.get::<_, String>(1), "horizon_s": r.get::<_, i32>(2),
+                "n": r.get::<_, i64>(3), "sellable": r.get::<_, i64>(4), "mean_net_return": r.get::<_, Option<f64>>(5), "positive_fraction": r.get::<_, Option<f64>>(6)})
+        })
+        .collect();
+    out["execution_checks"] = exec
+        .first()
+        .map(|r| serde_json::json!({"checks": r.get::<_, i64>(0), "compared": r.get::<_, i64>(1), "median_adverse_bps": r.get::<_, Option<f64>>(2), "mean_adverse_bps": r.get::<_, Option<f64>>(3)}))
+        .unwrap_or_default();
+    out["observation_gaps"] = gaps.first().map(|r| serde_json::json!({"count": r.get::<_, i64>(0), "total_s": r.get::<_, i64>(1) as f64 / 1e6})).unwrap_or_default();
     for (id, (start, sum, _)) in &rec.books {
         let closed: Vec<_> = rec.positions.iter().filter(|p| &p.book_id == id && p.realized_pnl.is_some()).cloned().collect();
         let open: Vec<_> = rec.positions.iter().filter(|p| &p.book_id == id && p.is_live()).cloned().collect();
@@ -368,6 +429,89 @@ async fn report(profile: &str, json: bool) -> anyhow::Result<()> {
         println!("  evaluations: {}", out["evaluations"]);
         println!("  top rejections: {}", out["top_rejections"]);
         println!("  orders: {}", out["orders"]);
+        println!("  forward evaluation (probe, net of fees): {}", out["forward_evaluation"]);
+        println!("  execution vs observed market trades: {}", out["execution_checks"]);
+        println!("  observation gaps: {}", out["observation_gaps"]);
     }
+    Ok(())
+}
+
+/// Live validation report: everything observed, nothing inferred.
+fn live_report(s: &Snapshot, seconds: u64) -> serde_json::Value {
+    let decoded = s.health.decoded_events;
+    let events = s.health.events_processed;
+    let feed = s.feed_status.as_ref();
+    let mut problems = Vec::new();
+    if events == 0 {
+        problems.push("no transactions received from any provider".to_string());
+    }
+    if events > 0 && decoded == 0 {
+        problems.push("transactions received but no venue events decoded".into());
+    }
+    if let Some(f) = feed {
+        if f.state != sniper_core::feed::FeedState::Healthy {
+            problems.push(format!("feed ended {:?}: {}", f.state, f.reasons.join("; ")));
+        }
+    }
+    if s.health.decode_warnings > 0 {
+        problems.push(format!("{} decode warnings (last: {:?})", s.health.decode_warnings, s.health.last_decode_warning));
+    }
+    serde_json::json!({
+        "verdict": {
+            "seconds": seconds,
+            "events_received": events,
+            "venue_events_decoded": decoded,
+            "decode_warnings": s.health.decode_warnings,
+            "tokens_tracked": s.health.tokens_tracked,
+            "feed_state": feed.map(|f| format!("{:?}", f.state)),
+            "coverage": feed.and_then(|f| f.coverage),
+            "problems": problems,
+            "live_validated": problems.is_empty() && events > 0,
+        },
+        "providers": s.providers,
+        "rpc_endpoints": s.rpc_endpoints,
+        "tx_fetch": s.tx_fetch,
+        "backfill": s.backfill,
+        "latency": s.latency,
+        "counters": s.counters,
+        "health": s.health,
+        "ingest": s.ingest,
+        "feed_status": s.feed_status,
+        "routes": s.routes,
+    })
+}
+
+async fn capture(signatures: Vec<String>, from_live: Option<usize>, out: PathBuf) -> anyhow::Result<()> {
+    let setup = sniper_core::live::LiveSetup::from_env()?;
+    let rpc = setup.rpc()?.context("capture needs an RPC endpoint (SOLANA_RPC_URLS or a derivable SOLANA_WS_URLS)")?;
+    let mut sigs = signatures;
+    if let Some(n) = from_live {
+        for prog in [programs::PUMP_FUN, programs::PUMP_SWAP] {
+            for s in rpc.get_signatures_for_address(prog, n, None).await? {
+                if !s.failed {
+                    sigs.push(s.signature);
+                }
+            }
+        }
+    }
+    anyhow::ensure!(!sigs.is_empty(), "nothing to capture: pass --signatures or --from-live N");
+    std::fs::create_dir_all(&out)?;
+    let mut saved = 0;
+    for sig in sigs {
+        let raw = rpc.get_transaction_raw(&sig).await?;
+        if raw.is_null() {
+            println!("{sig}: not found");
+            continue;
+        }
+        let doc = serde_json::json!({
+            "provenance": {"source": "getTransaction (jsonParsed)", "captured_at_us": wall_us(), "network": "mainnet-beta", "note": "REAL mainnet transaction captured read-only"},
+            "signature": sig,
+            "rpc_result": raw,
+        });
+        std::fs::write(out.join(format!("{sig}.json")), serde_json::to_string_pretty(&doc)?)?;
+        saved += 1;
+    }
+    println!("captured {saved} real transactions into {}", out.display());
+    println!("run `cargo test --test real_fixtures` to verify decoders against them");
     Ok(())
 }
