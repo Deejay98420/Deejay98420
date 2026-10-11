@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# One-command local workflow (macOS / Linux, bash 3.2 compatible). PAPER ONLY.
+#   ./scripts/sniper setup | start [fixture|live] [--profile NAME] | stop [--db] | status | test | report [PROFILE_KEY] | replay PROFILE_KEY | logs | db-up | db-down
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RUN="$ROOT/.run"
+CORE="$ROOT/core"
+DASH="$ROOT/dashboard"
+BIN="$CORE/target/release/sniper"
+mkdir -p "$RUN"
+
+if [ -f "$ROOT/.env" ]; then set -a; . "$ROOT/.env"; set +a; fi
+export DATABASE_URL="${DATABASE_URL:-postgres://sniper:sniper@127.0.0.1:55432/sniper}"
+export SNIPER_API_ADDR="${SNIPER_API_ADDR:-127.0.0.1:8787}"
+export SNIPER_CONFIG="${SNIPER_CONFIG:-config/strategy.toml}"
+case "$SNIPER_CONFIG" in /*) ;; *) export SNIPER_CONFIG="$ROOT/$SNIPER_CONFIG" ;; esac
+
+say() { printf '\033[1m[sniper]\033[0m %s\n' "$*"; }
+die() { printf '\033[31m[sniper] %s\033[0m\n' "$*" >&2; exit 1; }
+alive() { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing '$1' — $2"; }
+
+db_reachable() {
+  if command -v pg_isready >/dev/null 2>&1; then pg_isready -d "$DATABASE_URL" >/dev/null 2>&1; return $?; fi
+  (exec 3<>/dev/tcp/127.0.0.1/55432) 2>/dev/null
+}
+
+db_up() {
+  if db_reachable; then say "PostgreSQL reachable"; return 0; fi
+  need docker "install Docker Desktop (https://www.docker.com/products/docker-desktop) or point DATABASE_URL at a local PostgreSQL 14+"
+  say "starting PostgreSQL (docker compose)"
+  (cd "$ROOT" && docker compose up -d --wait postgres) || die "docker compose failed"
+}
+
+build() {
+  need cargo "install Rust via https://rustup.rs"
+  say "building engine (release)"
+  (cd "$CORE" && cargo build --release --quiet)
+}
+
+dash_deps() {
+  need npm "install Node.js 20+ (https://nodejs.org)"
+  if [ ! -d "$DASH/node_modules" ]; then say "installing dashboard dependencies"; (cd "$DASH" && npm install --no-audit --no-fund --silent); fi
+}
+
+cmd_setup() {
+  [ -f "$ROOT/.env" ] || { cp "$ROOT/.env.example" "$ROOT/.env"; say "created .env from .env.example (placeholders only)"; }
+  build; dash_deps
+  (cd "$CORE" && "$BIN" gen-fixtures --out "$ROOT/fixtures")
+  db_up
+  (cd "$CORE" && "$BIN" migrate)
+  say "setup complete. Next: ./scripts/sniper start"
+}
+
+# launch NAME DIR CMD... — the service writes its own pid just before exec, so the pid file is the
+# real process (no wrapper); stdin/stdout are detached so the caller's terminal is not held.
+launch() {
+  local name="$1" dir="$2"; shift 2
+  rm -f "$RUN/$name.pid"
+  (cd "$dir" && exec sh -c 'echo $$ > "$0"; exec nohup "$@"' "$RUN/$name.pid" "$@" < /dev/null > "$RUN/$name.log" 2>&1 &)
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$RUN/$name.pid" ] && return 0; sleep 0.2; done
+  die "$name failed to start"
+}
+
+cmd_start() {
+  local mode="fixture" profile=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      fixture|live) mode="$1" ;;
+      --profile) shift; profile="${1:-}" ;;
+      *) die "unknown start option: $1" ;;
+    esac
+    shift
+  done
+  alive "$RUN/engine.pid" && die "engine already running (pid $(cat "$RUN/engine.pid")); use ./scripts/sniper stop"
+  if [ "$mode" = "live" ] && [ -z "${SOLANA_WS_URL:-}" ]; then
+    die "LIVE mode needs SOLANA_WS_URL in .env (provider WebSocket). Use 'start fixture' for the offline replay."
+  fi
+  [ -x "$BIN" ] || build
+  db_up
+  [ -n "$profile" ] || profile="$( [ "$mode" = live ] && echo main || echo "run$(date +%s)")"
+  local key; key="$( [ "$mode" = live ] && echo "LIVE:$profile" || echo "FIXTURE:$profile")"
+  echo "$key" > "$RUN/profile"
+  local fx=()
+  [ "$mode" = fixture ] && [ -f "$ROOT/fixtures/hybrid_session.jsonl" ] && fx=(--fixture "$ROOT/fixtures/hybrid_session.jsonl")
+  say "starting engine: mode=$mode profile=$key api=$SNIPER_API_ADDR (PAPER ONLY)"
+  launch engine "$CORE" "$BIN" run --mode "$mode" --profile "$profile" --hold ${fx[@]+"${fx[@]}"}
+  dash_deps
+  if (exec 3<>/dev/tcp/127.0.0.1/3000) 2>/dev/null; then
+    say "WARNING: port 3000 already in use — dashboard not started (stop the other process first)"
+    return 0
+  fi
+  if [ ! -d "$DASH/.next" ]; then say "building dashboard"; (cd "$DASH" && npm run --silent build >/dev/null); fi
+  SNIPER_API_ADDR="$SNIPER_API_ADDR" launch dashboard "$DASH" node node_modules/next/dist/bin/next start -H 127.0.0.1 -p 3000
+  sleep 2
+  alive "$RUN/engine.pid" || { tail -20 "$RUN/engine.log"; die "engine exited — see .run/engine.log"; }
+  say "dashboard: http://127.0.0.1:3000   engine API: http://$SNIPER_API_ADDR/api/health"
+}
+
+stop_pid() {
+  local f="$RUN/$1.pid"
+  if alive "$f"; then
+    local pid kids k; pid="$(cat "$f")"
+    kids="$(pgrep -P "$pid" 2>/dev/null || true)"   # e.g. next start → next-server worker
+    kill -INT "$pid" 2>/dev/null || true             # engine: SIGINT → flush store, then exit
+    for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+    kill -0 "$pid" 2>/dev/null && kill -TERM "$pid" 2>/dev/null || true
+    for k in $kids; do kill -TERM "$k" 2>/dev/null || true; done
+    sleep 0.3
+    for k in $kids; do kill -0 "$k" 2>/dev/null && kill -KILL "$k" 2>/dev/null || true; done
+    say "stopped $1"
+  fi
+  rm -f "$f"
+}
+
+cmd_stop() {
+  stop_pid engine   # SIGINT → engine flushes the store before exiting
+  stop_pid dashboard
+  if [ "${1:-}" = "--db" ]; then (cd "$ROOT" && docker compose stop postgres) && say "PostgreSQL stopped"; fi
+}
+
+cmd_status() {
+  alive "$RUN/engine.pid" && say "engine: running (pid $(cat "$RUN/engine.pid"))" || say "engine: stopped"
+  alive "$RUN/dashboard.pid" && say "dashboard: running (pid $(cat "$RUN/dashboard.pid")) http://127.0.0.1:3000" || say "dashboard: stopped"
+  db_reachable && say "postgres: reachable" || say "postgres: not reachable"
+  [ -f "$RUN/profile" ] && say "last profile: $(cat "$RUN/profile")"
+  if alive "$RUN/engine.pid"; then
+    (cd "$CORE" && "$BIN" status --api "$SNIPER_API_ADDR") | head -60
+  fi
+}
+
+cmd_test() {
+  need cargo "install Rust via https://rustup.rs"
+  db_up || true
+  say "static PAPER-safety check"
+  "$ROOT/scripts/check_no_live.sh"
+  say "Rust tests (DATABASE_URL set → PostgreSQL integration tests run)"
+  (cd "$CORE" && cargo test --quiet)
+  dash_deps
+  say "dashboard typecheck + build"
+  (cd "$DASH" && npm run --silent typecheck && npm run --silent build >/dev/null)
+  say "all tests passed"
+}
+
+cmd_report() {
+  local key="${1:-}"
+  [ -n "$key" ] || key="$(cat "$RUN/profile" 2>/dev/null || true)"
+  [ -n "$key" ] || die "usage: report PROFILE_KEY (e.g. FIXTURE:run123 or LIVE:main)"
+  [ -x "$BIN" ] || build
+  (cd "$CORE" && "$BIN" report --profile "$key")
+}
+
+cmd_replay() {
+  [ -n "${1:-}" ] || die "usage: replay PROFILE_KEY"
+  [ -x "$BIN" ] || build
+  (cd "$CORE" && "$BIN" replay --from-profile "$1")
+}
+
+case "${1:-help}" in
+  setup) cmd_setup ;;
+  start) shift; cmd_start "$@" ;;
+  stop) shift; cmd_stop "$@" ;;
+  status) cmd_status ;;
+  test) cmd_test ;;
+  report) shift; cmd_report "$@" ;;
+  replay) shift; cmd_replay "$@" ;;
+  logs) tail -n 100 -f "$RUN/engine.log" ;;
+  db-up) db_up ;;
+  db-down) (cd "$ROOT" && docker compose stop postgres) ;;
+  *) sed -n '2,3p' "$0" ;;
+esac

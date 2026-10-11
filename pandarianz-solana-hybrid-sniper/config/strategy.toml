@@ -1,0 +1,27 @@
+# Strategy / cost overrides (all optional; defaults are in core/src/config.rs).
+# Any change here changes the strategy_version stamped on every record.
+[strategy]
+label = "hybrid"
+
+[strategy.entry]
+sizes_lamports = [20000000, 50000000, 100000000]   # 0.02 / 0.05 / 0.1 SOL
+size_score_thresholds = [0.0, 0.62, 0.80]
+max_entry_impact_bps = 350.0
+max_round_trip_cost_bps = 900.0
+max_size_fraction_of_liquidity = 0.03
+
+[strategy.exit]
+# dynamic, volatility-scaled trailing width — no fixed take-profit
+trail_vol_mult = 3.0
+min_trail = 0.10
+max_trail = 0.35
+max_hold_s = 900.0
+
+[risk]
+starting_balance_lamports = 1000000000
+max_open_positions = 3
+max_exposure_lamports = 250000000
+
+[costs]
+curve_fee_bps_default = 125   # used only when trade events do not report fees
+pumpswap_fee_bps = 30

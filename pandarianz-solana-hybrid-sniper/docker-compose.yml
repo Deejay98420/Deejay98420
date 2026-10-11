@@ -1,0 +1,20 @@
+# Local PostgreSQL for the PAPER engine. Data persists in the named volume.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: pandarianz-sniper-pg
+    environment:
+      POSTGRES_USER: sniper
+      POSTGRES_PASSWORD: sniper
+      POSTGRES_DB: sniper
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - sniper_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sniper -d sniper"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+volumes:
+  sniper_pg:

@@ -1,0 +1,42 @@
+[package]
+name = "sniper-core"
+version = "0.1.0"
+edition = "2021"
+description = "PAPER-ONLY Solana memecoin hybrid launch sniper / momentum trader core. No signing, no broadcasting."
+license = "UNLICENSED"
+publish = false
+
+[lib]
+name = "sniper_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sniper"
+path = "src/bin/sniper.rs"
+
+[dependencies]
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "fs", "io-util", "net"] }
+futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+axum = "0.7"
+tower-http = { version = "0.6", features = ["cors"] }
+clap = { version = "4", features = ["derive", "env"] }
+bs58 = "0.5"
+base64 = "0.22"
+sha2 = "0.10"
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+debug = 1
