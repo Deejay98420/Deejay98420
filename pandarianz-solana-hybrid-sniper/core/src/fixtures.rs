@@ -153,7 +153,11 @@ impl Curve {
             }),
         })
     }
-    fn trade_ev(&self, user: Pubkey, sol: u64, tokens: u64, is_buy: bool, fee: u64, t_us: i64) -> PumpEvent {
+    /// `sol` is the pre-fee amount (buy: cost of the tokens; sell: gross proceeds); fees are emitted
+    /// per component, ceil-rounded on that amount, as the pump SDK computes them.
+    fn trade_ev(&self, user: Pubkey, sol: u64, tokens: u64, is_buy: bool, _fee_total: u64, t_us: i64) -> PumpEvent {
+        let f = self.fees();
+        let (fee, creator_fee) = (math::fee(sol, f.protocol_bps), math::fee(sol, f.creator_bps));
         PumpEvent::Trade(PumpTrade {
             mint: self.mint,
             sol_amount: sol,
@@ -170,7 +174,7 @@ impl Curve {
             fee: Some(fee),
             creator: Some(self.creator),
             creator_fee_basis_points: Some(5),
-            creator_fee: Some(0),
+            creator_fee: Some(creator_fee),
             tail: Some(crate::decode::pumpfun::TradeTail {
                 track_volume: true,
                 total_unclaimed_tokens: 0,
@@ -220,7 +224,7 @@ impl Curve {
         self.vt += tokens;
         self.rs -= gross;
         self.rt += tokens;
-        Some(self.trade_ev(user, r.amount_out, tokens, false, r.fee, t_us))
+        Some(self.trade_ev(user, gross, tokens, false, r.fee, t_us))
     }
     pub fn complete_ev(&self, t_us: i64) -> PumpEvent {
         PumpEvent::Complete(PumpComplete { user: wallet("completer"), mint: self.mint, bonding_curve: self.bonding_curve, timestamp: t_us / 1_000_000, quote_mint: Some(Pubkey::default()) })

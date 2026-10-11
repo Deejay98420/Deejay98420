@@ -329,6 +329,23 @@ pub struct EngineConfig {
     pub exec_check_window_s: f64,
     /// "conservative" (min of venue simulation and a fresh Jupiter observation) or "venue_sim"
     pub fill_basis: String,
+    pub evidence: EvidenceConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EvidenceConfig {
+    /// a fill is "validated" only if the venue state it priced against was at most this old
+    pub validated_max_state_age_ms: f64,
+    /// decoded events needed (all hard checks passing) before a layout counts as mainnet-verified
+    pub min_events_for_mainnet_verified: u64,
+    /// real forward outcomes (calibration split) required before the expected-move model may be called calibrated
+    pub min_outcomes_for_calibration: u64,
+}
+impl Default for EvidenceConfig {
+    fn default() -> Self {
+        Self { validated_max_state_age_ms: 2_000.0, min_events_for_mainnet_verified: 5, min_outcomes_for_calibration: 1_000 }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -359,6 +376,7 @@ impl Default for EngineConfig {
             forward: ForwardConfig::default(),
             exec_check_window_s: 5.0,
             fill_basis: "conservative".into(),
+            evidence: EvidenceConfig::default(),
         }
     }
 }

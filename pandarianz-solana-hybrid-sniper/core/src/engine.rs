@@ -142,6 +142,19 @@ pub struct BookView {
     pub perf: PerfStats,
     /// strategy-specific performance (launch sniper vs momentum scanner)
     pub perf_by_path: BTreeMap<String, PerfStats>,
+    /// "launch@0.05" etc.
+    pub perf_by_path_size: BTreeMap<String, PerfStats>,
+    /// only positions whose entry AND exit fills carried executable-price evidence
+    pub perf_validated: PerfStats,
+    pub perf_unverified: PerfStats,
+    /// validated trades in the holdout split — the only figures to read as performance evidence
+    pub perf_validated_holdout: PerfStats,
+    pub perf_validated_calibration: PerfStats,
+    pub sensitivity_all: Vec<crate::metrics::SensitivityRow>,
+    pub sensitivity_validated: Vec<crate::metrics::SensitivityRow>,
+    pub order_outcomes: BTreeMap<String, u64>,
+    pub execution_failure_rate: Option<f64>,
+    pub unresolved_positions: usize,
     pub accounting_ok: bool,
     pub accounting_error: Option<String>,
 }
@@ -157,7 +170,10 @@ pub struct Snapshot {
     pub forward_pending: usize,
     pub execution_quality: ExecSummary,
     pub recent_execution_checks: Vec<ExecutionCheck>,
-    pub decoder_verification: Vec<crate::decode::Verification>,
+    pub decoder_verification: Vec<crate::decode::VerificationRow>,
+    pub expected_move_model_status: String,
+    /// per venue: how this run actually sees it (e.g. PumpSwap via getTransaction fetch)
+    pub coverage: BTreeMap<String, String>,
     pub counters: EngineCounters,
     pub status_banner: String,
     pub generated_us: i64,
@@ -239,6 +255,8 @@ pub struct Engine {
     pool_reqs: HashSet<Pubkey>,
     mint_reqs: HashSet<Pubkey>,
     pub stats: EngineCounters,
+    /// real-transaction decoder verification (fixtures/real/verification.json)
+    pub decoder_verification: Option<crate::verify::VerificationSummary>,
     /// stop the run loop when a finite source ends (fixture/replay without --hold)
     pub exit_on_end: bool,
 }
@@ -285,6 +303,8 @@ impl Engine {
             "tx_fetch",
             "slot_lag_slots",
             "end_to_end_recv_to_order",
+            "quote_age_at_decision",
+            "quote_age_at_fill",
         ] {
             lat.insert(k, lat_series());
         }
@@ -327,6 +347,7 @@ impl Engine {
             pool_reqs: HashSet::new(),
             mint_reqs: HashSet::new(),
             stats: EngineCounters::default(),
+            decoder_verification: None,
             exit_on_end: false,
             cfg,
         };
@@ -507,6 +528,9 @@ impl Engine {
                     SlotStatus::Confirmed => {}
                 }
             }
+            StreamMsg::Capability { provider, method, ok, detail, .. } => {
+                self.feed_mon.on_capability(&provider, &method, ok, &detail);
+            }
             StreamMsg::Tip { provider, slot, recv_us } => {
                 self.feed_mon.on_tip(&provider, slot, recv_us);
                 self.feed_tick(self.now()).await;
@@ -620,16 +644,6 @@ impl Engine {
         self.health.unresolved_pool_events = self.universe.unresolved_pool_events;
         self.health.raydium_decode_only = self.universe.raydium_decode_only;
 
-        // observed-execution comparisons against real trades
-        for (mint, a) in &touched {
-            if let Change::Trade { .. } = a.change {
-                if let Some(t) = self.universe.tokens.get(mint).and_then(|st| st.trades.back()).cloned() {
-                    for c in self.exec.on_trade(mint, &t) {
-                        self.record_exec_check(c).await;
-                    }
-                }
-            }
-        }
         self.request_lookups().await;
         self.feed_tick(now).await;
         self.background_tick(now).await;
@@ -745,6 +759,9 @@ impl Engine {
         if d.enter {
             self.entries_decided += 1;
             if let Some(q) = &d.quote {
+                self.lat("quote_age_at_decision", (q.state_age_ms * 1000.0) as i64);
+            }
+            if let Some(q) = &d.quote {
                 self.note_route("venue_sim", &Ok(q.clone()), now);
             }
             self.submit_entries(mint, &d, &f, raw, now).await;
@@ -829,6 +846,8 @@ impl Engine {
                         entry_in: q.in_amount,
                         tokens: q.out_amount,
                         horizons_s: self.cfg.forward.horizons_s.clone(),
+                        expected_move_bps: rec.expected_move_bps,
+                        data_mode: self.mode.as_str().into(),
                     });
                 }
             }
@@ -906,6 +925,7 @@ impl Engine {
                 observed_quote: None,
                 fill_basis: None,
                 aggregator_divergence_bps: None,
+                evidence: None,
             };
             book.entered_keys.insert(key);
             observe.push((bi, order.order_id.clone()));
@@ -934,6 +954,8 @@ impl Engine {
         let max_fill_age = self.cfg.strategy.entry.max_fill_state_age_ms;
         let basis = FillBasisMode::parse(&self.cfg.fill_basis);
         let mut cmds: Vec<StoreCmd> = Vec::new();
+        let mut exec_new: Vec<ExecutionCheck> = Vec::new();
+        let mut fill_ages: Vec<i64> = Vec::new();
         let mut fill_lat = Vec::new();
         for bi in 0..self.books.len() {
             let mut due: Vec<Order> = Vec::new();
@@ -952,10 +974,20 @@ impl Engine {
                 let st = self.universe.tokens.get(&o.mint);
                 let book = &mut self.books[bi];
                 let (outcome, ledger) = fill_order_with(&mut o, st, book, &self.fees, &costs, &exit_cfg, max_fill_age, basis, fill_ts);
+                *book.order_outcomes.entry(format!("{}:{}", serde_json::to_value(o.kind).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default(), serde_json::to_value(o.status).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default())).or_default() += 1;
+                if let Some(q) = &o.fill_quote {
+                    fill_ages.push((q.state_age_ms * 1000.0) as i64);
+                }
                 match o.status {
                     OrderStatus::Filled => {
                         self.stats.fills_ok += 1;
-                        self.exec.add(&o, fill_ts);
+                        let venue_ok = o.fill_quote.as_ref().and_then(|q| q.venue).is_some_and(|v| {
+                            self.decoder_verification.as_ref().and_then(|d| d.venues_mainnet_verified.get(v.as_str()).copied()).unwrap_or(false)
+                        });
+                        o.evidence = Some(crate::paper::assess_fill(&o, st, self.mode, venue_ok, self.cfg.evidence.validated_max_state_age_ms));
+                        if let Some(c) = st.and_then(|s| self.exec.check(&o, fill_ts, &s.trades)) {
+                            exec_new.push(c);
+                        }
                     }
                     OrderStatus::NoRoute => {
                         if o.error.as_deref().is_some_and(|e| e.contains("stale")) {
@@ -973,7 +1005,8 @@ impl Engine {
                 }
                 fill_lat.push((fill_ts - o.decision_us, o.fill_quote.clone(), o.status));
                 match outcome {
-                    FillOutcome::EntryFilled { position } => {
+                    FillOutcome::EntryFilled { mut position } => {
+                        position.entry_evidence = o.evidence.clone();
                         cmds.push(StoreCmd::Position(Box::new(position.clone())));
                         cmds.push(StoreCmd::PositionEvent {
                             position_id: position.position_id.clone(),
@@ -988,6 +1021,7 @@ impl Engine {
                             if let Some(mut p) = book.positions.remove(&pid) {
                                 let fill = o.fill.clone().unwrap();
                                 p.status = PositionStatus::Closed;
+                                p.exit_evidence = o.evidence.clone();
                                 p.closed_us = Some(fill_ts);
                                 p.proceeds = fill.out_amount;
                                 p.exit_tx_costs = o.costs.tx_costs();
@@ -1044,6 +1078,12 @@ impl Engine {
                 let group: Vec<StoreCmd> = cmds.drain(outer_len..).collect();
                 cmds.push(StoreCmd::Batch(group));
             }
+        }
+        for c in exec_new {
+            self.record_exec_check(c).await;
+        }
+        for a in fill_ages {
+            self.lat("quote_age_at_fill", a);
         }
         for (l, q, status) in fill_lat {
             self.lat("fill_latency_sim", l);
@@ -1253,6 +1293,7 @@ impl Engine {
             observed_quote: None,
             fill_basis: None,
             aggregator_divergence_bps: None,
+            evidence: None,
         };
         book.pending.push(order.clone());
         let (mint, tokens) = (p.mint, p.tokens);
@@ -1466,9 +1507,7 @@ impl Engine {
                 }
             }
         }
-        for c in self.exec.expire(now) {
-            self.record_exec_check(c).await;
-        }
+
     }
 
     /// Live: resolve unknown PumpSwap pools and check new mints via read-only RPC.
@@ -1508,6 +1547,30 @@ impl Engine {
         }
     }
 
+    fn coverage(&self) -> BTreeMap<String, String> {
+        let mut m = BTreeMap::new();
+        if self.mode != DataMode::Live {
+            m.insert("all".into(), format!("offline {} source", self.mode.as_str()));
+            return m;
+        }
+        let caps: Vec<&BTreeMap<String, String>> = self.feed_mon.providers.values().map(|p| &p.capabilities).collect();
+        let accepted = |method: &str| caps.iter().any(|c| c.get(method).is_some_and(|v| v.starts_with("accepted")));
+        let fetch = self.live.fetch_stats.as_ref().map(|f| f.snapshot());
+        m.insert("pump_bonding_curve".into(), if accepted("logsSubscribe") || accepted("transactionSubscribe") { "covered (subscription accepted)".into() } else { "NOT COVERED: no accepted subscription yet".into() });
+        m.insert(
+            "pumpswap".into(),
+            if accepted("transactionSubscribe") {
+                "covered natively (transactionSubscribe)".into()
+            } else if self.live.rpc.is_some() {
+                format!("covered via getTransaction fetch ({} fetched)", fetch.map(|f| f.fetched).unwrap_or(0))
+            } else {
+                "NOT COVERED: logs-only provider and no RPC for fetch".into()
+            },
+        );
+        m.insert("raydium_amm_v4".into(), "decode-only (never traded)".into());
+        m
+    }
+
     // ------------------------------------------------------------------ snapshot
 
     pub fn snapshot(&self) -> Snapshot {
@@ -1536,6 +1599,26 @@ impl Engine {
                     open_positions: open,
                     pending_orders: b.pending.len(),
                     perf: perf(&b.closed),
+                    perf_by_path_size: {
+                        let mut m: BTreeMap<String, Vec<Position>> = BTreeMap::new();
+                        for p in &b.closed {
+                            m.entry(format!("{}@{}", p.path.as_str(), crate::metrics::size_label(p.cost_basis))).or_default().push(p.clone());
+                        }
+                        m.into_iter().map(|(k, v)| (k, perf(&v))).collect()
+                    },
+                    perf_validated: perf(&b.closed.iter().filter(|p| p.validated()).cloned().collect::<Vec<_>>()),
+                    perf_unverified: perf(&b.closed.iter().filter(|p| !p.validated()).cloned().collect::<Vec<_>>()),
+                    perf_validated_holdout: perf(&b.closed.iter().filter(|p| p.validated() && crate::metrics::evidence_split(p.opened_us) == "holdout").cloned().collect::<Vec<_>>()),
+                    perf_validated_calibration: perf(&b.closed.iter().filter(|p| p.validated() && crate::metrics::evidence_split(p.opened_us) == "calibration").cloned().collect::<Vec<_>>()),
+                    sensitivity_all: crate::metrics::sensitivity(&b.closed, b.scenario.priority_fee_lamports),
+                    sensitivity_validated: crate::metrics::sensitivity(&b.closed.iter().filter(|p| p.validated()).cloned().collect::<Vec<_>>(), b.scenario.priority_fee_lamports),
+                    order_outcomes: b.order_outcomes.clone(),
+                    execution_failure_rate: {
+                        let total: u64 = b.order_outcomes.values().sum();
+                        let failed: u64 = b.order_outcomes.iter().filter(|(k, _)| !k.ends_with(":filled")).map(|(_, v)| v).sum();
+                        (total > 0).then(|| failed as f64 / total as f64)
+                    },
+                    unresolved_positions: b.positions.values().filter(|p| p.status == PositionStatus::Unresolved).count(),
                     perf_by_path: ["launch", "momentum"]
                         .iter()
                         .map(|k| (k.to_string(), perf(&b.closed.iter().filter(|p| p.path.as_str() == *k).cloned().collect::<Vec<_>>())))
@@ -1562,7 +1645,9 @@ impl Engine {
             forward_pending: self.fwd.pending(),
             execution_quality: crate::execcheck::summarize(&self.exec_recent),
             recent_execution_checks: self.exec_recent.iter().rev().take(50).cloned().collect(),
-            decoder_verification: crate::decode::verification(),
+            decoder_verification: crate::decode::verification_with(self.decoder_verification.as_ref()),
+            expected_move_model_status: crate::forward::expected_move_status(&self.fwd_recent, self.mode == DataMode::Live, self.cfg.evidence.min_outcomes_for_calibration),
+            coverage: self.coverage(),
             counters: EngineCounters {
                 pools_resolved: self.universe.pools_resolved,
                 ..self.stats.clone()

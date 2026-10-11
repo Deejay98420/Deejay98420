@@ -58,6 +58,13 @@ fn check_dir(dir: &std::path::Path, network: &str) -> (usize, usize, usize) {
         let raw = parse_tx_object(&doc["rpc_result"], Some(sig), 0, "capture", Commitment::Confirmed, 0).expect("parsable transaction");
         let out = decode_raw(&raw);
         assert!(out.warnings.is_empty(), "{}: {:?}", f.display(), out.warnings);
+        if network == "mainnet-beta" {
+            // independent transaction evidence (token/SOL balance deltas, fee arithmetic)
+            let v = sniper_core::verify::verify_tx(&doc["rpc_result"], sig);
+            let failed: Vec<_> = v.checks.iter().filter(|c| c.hard && !c.ok).map(|c| format!("{}: {}", c.name, c.detail)).collect();
+            assert!(failed.is_empty(), "{}: decoder disagrees with transaction evidence: {failed:?}", f.display());
+            assert!(doc["provenance"]["slot"].as_u64().is_some() || doc["rpc_result"]["slot"].as_u64().is_some(), "slot provenance");
+        }
         for d in &out.events {
             events += 1;
             match &d.event {

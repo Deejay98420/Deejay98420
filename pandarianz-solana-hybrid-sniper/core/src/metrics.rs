@@ -122,3 +122,74 @@ pub fn perf(closed: &[Position]) -> PerfStats {
     }
     s
 }
+
+/// Fixed, data-independent split: even UTC days → "calibration", odd UTC days → "holdout".
+/// Thresholds may only be tuned on calibration data; reported performance uses holdout data.
+pub fn evidence_split(ts_us: i64) -> &'static str {
+    if (ts_us.div_euclid(86_400_000_000)) % 2 == 0 { "calibration" } else { "holdout" }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SensitivityRow {
+    pub label: String,
+    pub fee_mult: f64,
+    pub extra_slippage_bps_per_side: f64,
+    pub priority_fee_mult: f64,
+    pub trades: u32,
+    pub net_sol: f64,
+    pub expectancy_sol: Option<f64>,
+    pub profit_factor: Option<f64>,
+    pub win_rate: Option<f64>,
+}
+
+/// Re-cost closed trades under harsher fee / slippage / priority-fee assumptions.
+pub fn sensitivity(closed: &[Position], priority_fee_per_tx: u64) -> Vec<SensitivityRow> {
+    let grid: &[(&str, f64, f64, f64)] = &[
+        ("as simulated", 1.0, 0.0, 1.0),
+        ("venue fees ×1.5", 1.5, 0.0, 1.0),
+        ("venue fees ×2", 2.0, 0.0, 1.0),
+        ("+50 bps slippage/side", 1.0, 50.0, 1.0),
+        ("+100 bps slippage/side", 1.0, 100.0, 1.0),
+        ("+200 bps slippage/side", 1.0, 200.0, 1.0),
+        ("priority fee ×2", 1.0, 0.0, 2.0),
+        ("priority fee ×5", 1.0, 0.0, 5.0),
+        ("stress: fees ×1.5, +100 bps, priority ×2", 1.5, 100.0, 2.0),
+    ];
+    let trades: Vec<&Position> = closed.iter().filter(|p| p.realized_pnl.is_some()).collect();
+    grid.iter()
+        .map(|(label, fm, slip, pm)| {
+            let pnls: Vec<i64> = trades
+                .iter()
+                .map(|p| {
+                    let entry_in = p.cost_basis.saturating_sub(p.entry_tx_costs);
+                    let extra = (fm - 1.0) * p.venue_fees_paid as f64
+                        + slip / 10_000.0 * (entry_in + p.proceeds) as f64
+                        + (pm - 1.0) * 2.0 * priority_fee_per_tx as f64;
+                    p.realized_pnl.unwrap() - extra.round() as i64
+                })
+                .collect();
+            let n = pnls.len() as u32;
+            let gp: i64 = pnls.iter().filter(|x| **x > 0).sum();
+            let gl: i64 = -pnls.iter().filter(|x| **x <= 0).sum::<i64>();
+            let net: i64 = pnls.iter().sum();
+            SensitivityRow {
+                label: label.to_string(),
+                fee_mult: *fm,
+                extra_slippage_bps_per_side: *slip,
+                priority_fee_mult: *pm,
+                trades: n,
+                net_sol: sol(net),
+                expectancy_sol: (n > 0).then(|| sol(net) / n as f64),
+                profit_factor: (gl > 0).then(|| gp as f64 / gl as f64),
+                win_rate: (n > 0).then(|| pnls.iter().filter(|x| **x > 0).count() as f64 / n as f64),
+            }
+        })
+        .collect()
+}
+
+pub fn size_label(cost_basis: u64) -> String {
+    // nearest configured size bucket (0.02 / 0.05 / 0.1 SOL)
+    let s = cost_basis as f64 / 1e9;
+    let b = [0.02, 0.05, 0.1].iter().copied().min_by(|a, b| (a - s).abs().partial_cmp(&(b - s).abs()).unwrap()).unwrap();
+    format!("{b:.2}")
+}

@@ -114,6 +114,8 @@ pub struct Order {
     /// (venue simulation out − aggregator out) / aggregator out, bps
     #[serde(default)]
     pub aggregator_divergence_bps: Option<f64>,
+    #[serde(default)]
+    pub evidence: Option<FillEvidence>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,11 +175,19 @@ pub struct Position {
     pub trigger_slot: u64,
     pub trigger_rolled_back: bool,
     pub version: u64,
+    #[serde(default)]
+    pub entry_evidence: Option<FillEvidence>,
+    #[serde(default)]
+    pub exit_evidence: Option<FillEvidence>,
 }
 
 impl Position {
     pub fn is_live(&self) -> bool {
         matches!(self.status, PositionStatus::Open | PositionStatus::Exiting | PositionStatus::Unresolved)
+    }
+    /// Both fills carried sufficient executable-price evidence.
+    pub fn validated(&self) -> bool {
+        self.entry_evidence.as_ref().is_some_and(|e| e.validated) && self.exit_evidence.as_ref().is_some_and(|e| e.validated)
     }
     pub fn hold_s(&self, now_us: i64) -> f64 {
         (self.closed_us.unwrap_or(now_us) - self.opened_us) as f64 / 1e6
@@ -224,6 +234,8 @@ pub struct Book {
     pub entered_keys: HashSet<String>,
     pub failed_entry_costs: u64,
     pub order_counter: u64,
+    /// completed orders by kind/status (execution failure rate)
+    pub order_outcomes: std::collections::BTreeMap<String, u64>,
 }
 
 pub struct Posted {
@@ -247,6 +259,7 @@ impl Book {
             entered_keys: HashSet::new(),
             failed_entry_costs: 0,
             order_counter: 0,
+            order_outcomes: Default::default(),
         }
     }
 
@@ -527,6 +540,8 @@ pub fn fill_order_with(
                 trigger_slot: order.trigger_slot,
                 trigger_rolled_back: false,
                 version: 1,
+                entry_evidence: None,
+                exit_evidence: None,
             };
             order.position_id = Some(pid);
             (FillOutcome::EntryFilled { position }, ledger)
@@ -545,5 +560,62 @@ pub fn fill_order_with(
             }
             (FillOutcome::ExitFilled, ledger)
         }
+    }
+}
+
+/// Evidence quality of one simulated fill. Only `validated` fills count toward validated P&L.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct FillEvidence {
+    pub validated: bool,
+    pub reasons: Vec<String>,
+    pub state_age_ms: Option<f64>,
+    /// observed_event | assumed_default
+    pub fee_source: String,
+    /// how the landing delay was modelled
+    pub latency_basis: String,
+}
+
+/// Classify a filled order. `venue_mainnet_verified` reflects real-transaction decoder verification.
+pub fn assess_fill(o: &Order, st: Option<&TokenState>, mode: DataMode, venue_mainnet_verified: bool, max_state_age_ms: f64) -> FillEvidence {
+    let mut r = Vec::new();
+    if mode != DataMode::Live {
+        r.push(format!("{} data (not live market data)", mode.as_str()));
+    }
+    let venue = o.fill_quote.as_ref().and_then(|q| q.venue);
+    if !venue_mainnet_verified {
+        r.push(format!("decoder for {} not verified against captured mainnet transactions", venue.map(|v| v.as_str()).unwrap_or("aggregator route")));
+    }
+    let age = o.fill_quote.as_ref().map(|q| q.state_age_ms);
+    match o.fill_basis.as_deref() {
+        Some("aggregator_quote") => {
+            let qa = o.fill_quote.as_ref().map(|q| (o.completed_us.unwrap_or(0) - q.quoted_at_us) as f64 / 1e3).unwrap_or(f64::MAX);
+            if qa > max_state_age_ms {
+                r.push(format!("aggregator quote {qa:.0} ms old at fill"));
+            }
+        }
+        _ => {
+            if let Some(a) = age {
+                if a > max_state_age_ms {
+                    r.push(format!("venue state {a:.0} ms old at fill (> {max_state_age_ms:.0} ms)"));
+                }
+            } else {
+                r.push("no executable quote recorded".into());
+            }
+        }
+    }
+    let fee_observed = match venue {
+        Some(crate::types::Venue::PumpBondingCurve) => st.is_some_and(|s| s.curve_fees.is_some()),
+        Some(crate::types::Venue::PumpSwap) => st.and_then(|s| s.pool).is_some_and(|p| p.fees.is_some()),
+        _ => o.fill_basis.as_deref() == Some("aggregator_quote"),
+    };
+    if !fee_observed {
+        r.push("fee rates assumed (not observed on a recent event)".into());
+    }
+    FillEvidence {
+        validated: r.is_empty(),
+        reasons: r,
+        state_age_ms: age,
+        fee_source: if fee_observed { "observed_event".into() } else { "assumed_default".into() },
+        latency_basis: "configured scenario latency after measured pipeline delay".into(),
     }
 }

@@ -46,6 +46,8 @@ pub struct ProviderHealth {
     pub last_event_us: Option<i64>,
     pub tip_slot: Option<u64>,
     pub last_tip_us: Option<i64>,
+    /// subscription method → "accepted: …" / "REJECTED: …" (explicit capability check)
+    pub capabilities: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -126,6 +128,11 @@ impl FeedMonitor {
         if self.first_us.is_none() && matches!(state, ConnState::Connected | ConnState::Subscribed) {
             self.first_us = Some(ts);
         }
+    }
+
+    pub fn on_capability(&mut self, provider: &str, method: &str, ok: bool, detail: &str) {
+        let p = self.providers.entry(provider.to_string()).or_default();
+        p.capabilities.insert(method.to_string(), format!("{}: {detail}", if ok { "accepted" } else { "REJECTED" }));
     }
 
     pub fn on_event(&mut self, provider: &str, slot: u64, ts: i64) {

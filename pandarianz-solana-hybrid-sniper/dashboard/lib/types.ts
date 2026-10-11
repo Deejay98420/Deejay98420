@@ -21,6 +21,8 @@ export interface BookView {
   book_id: string; scenario: string; balance_sol: number; reserved_sol: number; rent_locked_sol: number; open_value_sol: number;
   equity_sol: number; start_sol: number; equity_pnl_sol: number; exposure_sol: number; failed_entry_costs_sol: number;
   open_positions: Position[]; pending_orders: number; perf: PerfStats; perf_by_path: Record<string, PerfStats>; accounting_ok: boolean; accounting_error: string | null;
+  perf_by_path_size: Record<string, PerfStats>; perf_validated: PerfStats; perf_unverified: PerfStats; perf_validated_holdout: PerfStats; perf_validated_calibration: PerfStats;
+  sensitivity_all: Sensitivity[]; sensitivity_validated: Sensitivity[]; order_outcomes: Record<string, number>; execution_failure_rate: number | null; unresolved_positions: number;
 }
 export interface FeedItem { ts_us: number; slot: number; signature: string; mint: string; symbol: string | null; kind: string; detail: string; data_mode: DataMode }
 export interface Candidate {
@@ -41,7 +43,7 @@ export interface FeedStatus {
   tip_slot: number | null; tip_age_ms: number | null; last_event_age_ms: number | null; slot_lag: number | null;
   coverage: number | null; open_gap: Gap | null; recent_gaps: Gap[];
 }
-export interface ProviderHealth { state: string | null; detail: string; since_us: number; reconnects: number; first_deliveries: number; last_event_us: number | null; tip_slot: number | null; last_tip_us: number | null }
+export interface ProviderHealth { capabilities: Record<string, string>; state: string | null; detail: string; since_us: number; reconnects: number; first_deliveries: number; last_event_us: number | null; tip_slot: number | null; last_tip_us: number | null }
 export interface EndpointStats { host: string; requests: number; ok: number; errors: number; rate_limited: number; last_error: string | null; last_latency_us: number | null }
 export interface ForwardBucket { n: number; unsellable: number; mean_net_return: number | null; median_net_return: number | null; positive_fraction: number | null }
 export interface ExecSummary { checks: number; compared: number; no_comparable_trade: number; median_adverse_bps: number | null; mean_adverse_bps: number | null; within_150bps: number | null }
@@ -54,8 +56,11 @@ export interface Snapshot {
   backfill: { signatures_listed: number; transactions_loaded: number; failed_or_missing: number; duration_ms: number; errors: string[] } | null;
   forward_summary: Record<string, ForwardBucket>; forward_pending: number; execution_quality: ExecSummary;
   recent_execution_checks: ExecCheck[]; decoder_verification: Verification[]; counters: Counters; status_banner: string;
+  expected_move_model_status: string; coverage: Record<string, string>;
   generated_us: number; paper_only: boolean; data_mode: DataMode | null; data_mode_note: string; profile_key: string; run_id: string;
   strategy_version: string; health: Health; ingest: Ingest | null; store_backend: string; store_written: number; store_errors: number;
   feed: FeedItem[]; candidates: Candidate[]; rejection_counts: Record<string, number>; books: BookView[]; trades: Position[];
   latency: Record<string, LatencySummary>; routes: Record<string, RouteStats>; evaluations: number; entries_decided: number;
 }
+
+export interface Sensitivity { label: string; trades: number; net_sol: number; expectancy_sol: number | null; profit_factor: number | null; win_rate: number | null }

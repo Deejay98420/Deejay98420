@@ -68,6 +68,23 @@ enum Cmd {
         #[arg(long, default_value = "../reports")]
         out: PathBuf,
     },
+    /// Diagnose provider connectivity and subscription capabilities (keys are never printed).
+    Doctor {
+        #[arg(long, default_value_t = 20)]
+        listen_seconds: u64,
+        #[arg(long, default_value = "../reports")]
+        out: PathBuf,
+    },
+    /// Verify captured real transactions against transaction evidence; writes fixtures/real/verification.json.
+    VerifyFixtures {
+        #[arg(long, default_value = "../fixtures/real")]
+        dir: PathBuf,
+    },
+    /// Calibration-split analysis of the expected-move model (read-only; never changes config).
+    Calibrate {
+        #[arg(long)]
+        profile: String,
+    },
     /// Capture real mainnet transactions (read-only getTransaction) as regression fixtures.
     Capture {
         /// comma-separated signatures to capture
@@ -200,6 +217,9 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Capture { signatures, from_live, out } => capture(signatures, from_live, out).await,
+        Cmd::Doctor { listen_seconds, out } => doctor(listen_seconds, out).await,
+        Cmd::VerifyFixtures { dir } => verify_fixtures(&dir, EngineConfig::load(std::env::var("SNIPER_CONFIG").ok().map(PathBuf::from).as_deref())?.evidence.min_events_for_mainnet_verified),
+        Cmd::Calibrate { profile } => calibrate(&profile).await,
     }
 }
 
@@ -252,6 +272,10 @@ async fn run_engine(
     };
     let fetch_stats = Arc::new(sniper_core::live::FetchStats::default());
     engine.live = sniper_core::engine::LiveServices { rpc: rpc.clone(), fetch_stats: Some(fetch_stats.clone()), backfill: None };
+    engine.decoder_verification = sniper_core::verify::load_summary(std::path::Path::new("../fixtures/real/verification.json"));
+    if engine.decoder_verification.is_none() {
+        tracing::warn!("no fixtures/real/verification.json: decoders are IDL-verified only; every fill is marked unverified");
+    }
     engine.warmup(&warm);
     engine.boot(cfg_json).await;
     engine.exit_on_end = !hold;
@@ -395,9 +419,23 @@ async fn report(profile: &str, json: bool) -> anyhow::Result<()> {
         let closed: Vec<_> = rec.positions.iter().filter(|p| &p.book_id == id && p.realized_pnl.is_some()).cloned().collect();
         let open: Vec<_> = rec.positions.iter().filter(|p| &p.book_id == id && p.is_live()).cloned().collect();
         let perf = sniper_core::metrics::perf(&closed);
+        let validated: Vec<_> = closed.iter().filter(|p| p.validated()).cloned().collect();
+        let holdout: Vec<_> = validated.iter().filter(|p| sniper_core::metrics::evidence_split(p.opened_us) == "holdout").cloned().collect();
+        let by_ps = {
+            let mut m: std::collections::BTreeMap<String, Vec<sniper_core::paper::Position>> = Default::default();
+            for p in &validated {
+                m.entry(format!("{}@{}", p.path.as_str(), sniper_core::metrics::size_label(p.cost_basis))).or_default().push(p.clone());
+            }
+            m.into_iter().map(|(k, v)| (k, sniper_core::metrics::perf(&v))).collect::<std::collections::BTreeMap<_, _>>()
+        };
         out["books"].as_array_mut().unwrap().push(serde_json::json!({
             "book_id": id, "start_sol": sol(*start as i64), "balance_sol": sol(*start as i64 + sum),
-            "open_or_unresolved": open.len(), "perf": perf,
+            "open_or_unresolved": open.len(), "unresolved": open.iter().filter(|p| p.status == sniper_core::paper::PositionStatus::Unresolved).count(),
+            "perf": perf,
+            "validated_closed": validated.len(), "unverified_closed": closed.len() - validated.len(),
+            "perf_validated_holdout": sniper_core::metrics::perf(&holdout),
+            "perf_validated_by_strategy_size": by_ps,
+            "sensitivity_validated": sniper_core::metrics::sensitivity(&validated, 200_000),
         }));
     }
     out["evaluations"] = rows.iter().map(|r| serde_json::json!({"decision": r.get::<_, String>(0), "path": r.get::<_, String>(1), "n": r.get::<_, i64>(2)})).collect();
@@ -411,10 +449,22 @@ async fn report(profile: &str, json: bool) -> anyhow::Result<()> {
             println!("NOTE: FIXTURE profile — synthetic data, results say nothing about real profitability.");
         }
         for b in out["books"].as_array().unwrap() {
+            let h = &b["perf_validated_holdout"];
+            println!(
+                "  {}: VALIDATED HOLDOUT (evidence) trades {} net {:+.4} SOL expectancy {} PF {} maxDD {:.4} | validated {} / unverified {} closed | unresolved {}",
+                b["book_id"].as_str().unwrap_or(""),
+                h["closed_trades"],
+                h["realized_pnl_sol"].as_f64().unwrap_or(0.0),
+                h["expectancy_sol"],
+                h["profit_factor"],
+                h["max_drawdown_sol"].as_f64().unwrap_or(0.0),
+                b["validated_closed"],
+                b["unverified_closed"],
+                b["unresolved"]
+            );
             let p = &b["perf"];
             println!(
-                "  {}: balance {:.4} SOL (start {:.4}), closed {}, win_rate {}, PF {}, expectancy {}, realized {:+.4}, maxDD {:.4}, open/unresolved {}",
-                b["book_id"].as_str().unwrap_or(""),
+                "    all trades (incl. unverified): balance {:.4} SOL (start {:.4}), closed {}, win_rate {}, PF {}, expectancy {}, realized {:+.4}, maxDD {:.4}, open/unresolved {}",
                 b["balance_sol"].as_f64().unwrap_or(0.0),
                 b["start_sol"].as_f64().unwrap_or(0.0),
                 p["closed_trades"],
@@ -484,34 +534,182 @@ fn live_report(s: &Snapshot, seconds: u64) -> serde_json::Value {
 async fn capture(signatures: Vec<String>, from_live: Option<usize>, out: PathBuf) -> anyhow::Result<()> {
     let setup = sniper_core::live::LiveSetup::from_env()?;
     let rpc = setup.rpc()?.context("capture needs an RPC endpoint (SOLANA_RPC_URLS or a derivable SOLANA_WS_URLS)")?;
-    let mut sigs = signatures;
+    std::fs::create_dir_all(&out)?;
+    let mut sigs: Vec<String> = signatures;
+    let mut want: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     if let Some(n) = from_live {
+        // sample widely, then keep a diverse set: every launch / completion / migration found + up to n trades per venue
         for prog in [programs::PUMP_FUN, programs::PUMP_SWAP] {
-            for s in rpc.get_signatures_for_address(prog, n, None).await? {
-                if !s.failed {
-                    sigs.push(s.signature);
+            let mut before: Option<String> = None;
+            for _ in 0..4 {
+                let page = rpc.get_signatures_for_address(prog, 250, before.as_deref()).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                before = page.last().map(|s| s.signature.clone());
+                sigs.extend(page.into_iter().filter(|s| !s.failed).map(|s| s.signature));
+                if before.is_none() {
+                    break;
                 }
             }
         }
+        want.insert("trade_buy", n);
+        want.insert("trade_sell", n);
+        want.insert("pool_swap_buy", n);
+        want.insert("pool_swap_sell", n);
+        want.insert("launch", n);
+        want.insert("curve_complete", n);
+        want.insert("migration", n);
+        want.insert("pool_create", n);
+        want.insert("liquidity", n);
     }
     anyhow::ensure!(!sigs.is_empty(), "nothing to capture: pass --signatures or --from-live N");
-    std::fs::create_dir_all(&out)?;
+    sigs.dedup();
+    let mut kept: std::collections::BTreeMap<String, usize> = Default::default();
     let mut saved = 0;
     for sig in sigs {
-        let raw = rpc.get_transaction_raw(&sig).await?;
+        if from_live.is_some() && want.iter().all(|(k, n)| kept.get(*k).copied().unwrap_or(0) >= *n) {
+            break;
+        }
+        let raw = match rpc.get_transaction_raw(&sig).await {
+            Ok(r) => r,
+            Err(e) => {
+                println!("{}…: {}", &sig[..8.min(sig.len())], e);
+                continue;
+            }
+        };
         if raw.is_null() {
-            println!("{sig}: not found");
             continue;
         }
+        let v = sniper_core::verify::verify_tx(&raw, &sig);
+        if v.items.is_empty() {
+            continue;
+        }
+        if from_live.is_some() {
+            let useful = v.classification.iter().any(|c| kept.get(c.as_str()).copied().unwrap_or(0) < want.get(c.as_str()).copied().unwrap_or(0));
+            if !useful {
+                continue;
+            }
+        }
+        for c in &v.classification {
+            *kept.entry(c.clone()).or_default() += 1;
+        }
         let doc = serde_json::json!({
-            "provenance": {"source": "getTransaction (jsonParsed)", "captured_at_us": wall_us(), "network": "mainnet-beta", "note": "REAL mainnet transaction captured read-only"},
+            "provenance": {"source": "getTransaction (jsonParsed)", "captured_at_us": wall_us(), "network": "mainnet-beta",
+                "slot": v.slot, "block_time": v.block_time, "classification": v.classification,
+                "note": "REAL mainnet transaction captured read-only"},
             "signature": sig,
             "rpc_result": raw,
         });
         std::fs::write(out.join(format!("{sig}.json")), serde_json::to_string_pretty(&doc)?)?;
         saved += 1;
     }
-    println!("captured {saved} real transactions into {}", out.display());
-    println!("run `cargo test --test real_fixtures` to verify decoders against them");
+    println!("captured {saved} real transactions into {} — by type: {kept:?}", out.display());
+    verify_fixtures(&out, 5)
+}
+
+fn verify_fixtures(dir: &std::path::Path, min_events: u64) -> anyhow::Result<()> {
+    let mut results = Vec::new();
+    let mut files: Vec<_> = std::fs::read_dir(dir).map(|r| r.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json") && !p.ends_with("verification.json")).collect()).unwrap_or_default();
+    files.sort();
+    for f in &files {
+        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(f)?)?;
+        if doc["provenance"]["network"] != "mainnet-beta" {
+            continue;
+        }
+        results.push(sniper_core::verify::verify_tx(&doc["rpc_result"], doc["signature"].as_str().unwrap_or("")));
+    }
+    let summary = sniper_core::verify::summarize(&results, min_events);
+    std::fs::write(dir.join("verification.json"), serde_json::to_string_pretty(&summary)?)?;
+    println!("DECODER VALIDATION against {} real mainnet transactions:", summary.files);
+    if summary.files == 0 {
+        println!("  none captured yet — run `./scripts/sniper capture 25` with provider access");
+    }
+    for (item, st) in &summary.items {
+        println!(
+            "  {:<52} txs {:>3} events {:>4}  hard checks {:>4} ok / {:>2} failed  → {}",
+            item,
+            st.transactions,
+            st.events,
+            st.hard_checks_passed,
+            st.hard_checks_failed,
+            if st.mainnet_verified { "MAINNET VERIFIED" } else if st.hard_checks_failed > 0 { "MISMATCH" } else { "insufficient samples" }
+        );
+    }
+    for f in summary.failures.iter().take(20) {
+        println!("  FAIL {f}");
+    }
+    println!("venues mainnet-verified for validated P&L: {:?}", summary.venues_mainnet_verified);
+    Ok(())
+}
+
+async fn doctor(listen_seconds: u64, out: PathBuf) -> anyhow::Result<()> {
+    let ws_urls: Vec<String> = std::env::var("SOLANA_WS_URLS").or_else(|_| std::env::var("SOLANA_WS_URL")).unwrap_or_default().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && !s.contains('<')).collect();
+    let mut rpc_urls: Vec<String> = std::env::var("SOLANA_RPC_URLS").or_else(|_| std::env::var("SOLANA_RPC_URL")).unwrap_or_default().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && !s.contains('<')).collect();
+    if rpc_urls.is_empty() {
+        rpc_urls = ws_urls.iter().filter_map(|u| sniper_core::live::ws_to_http(u)).collect();
+    }
+    println!("probing {} WebSocket and {} RPC endpoint(s) (read-only, {listen_seconds}s listen)…", ws_urls.len(), rpc_urls.len());
+    let ws = futures_util::future::join_all(ws_urls.iter().map(|u| sniper_core::doctor::probe_ws(u, Duration::from_secs(listen_seconds)))).await;
+    let rpc = futures_util::future::join_all(rpc_urls.iter().map(|u| sniper_core::doctor::probe_rpc(u))).await;
+    let jup = sniper_core::doctor::probe_jupiter(std::env::var("JUPITER_QUOTE_URL").ok().filter(|u| !u.contains('<')).as_deref(), std::env::var("JUPITER_API_KEY").ok().filter(|s| !s.is_empty())).await;
+    let rep = sniper_core::doctor::assess(ws, rpc, jup);
+    std::fs::create_dir_all(&out)?;
+    let path = out.join(format!("doctor-{}.json", wall_us() / 1_000_000));
+    let mut secrets = ws_urls.clone();
+    secrets.extend(rpc_urls.clone());
+    secrets.extend(std::env::var("JUPITER_QUOTE_URL").ok());
+    let text = sniper_core::doctor::scrub(&serde_json::to_string_pretty(&rep)?, &secrets);
+    std::fs::write(&path, &text)?;
+    for w in &rep.ws {
+        println!("WS  {}  connected={} connect={:?}ms", w.host, w.connected, w.connect_ms.map(|x| x.round()));
+        for (k, v) in &w.subscriptions {
+            println!("      {:<24} {:<10} notifications={} {}", k, match v.accepted { Some(true) => "accepted", Some(false) => "REJECTED", None => "no answer" }, v.notifications, sniper_core::doctor::scrub(&v.detail, &secrets));
+        }
+        if let Some(e) = &w.error {
+            println!("      error: {}", sniper_core::doctor::scrub(e, &secrets));
+        }
+    }
+    for r in &rep.rpc {
+        println!("RPC {}  ok={} getSlot={:?}ms pump events decoded={} pumpswap events decoded={} {}", r.host, r.ok, r.get_slot_ms.map(|x| x.round()), r.pump_events_decoded, r.pumpswap_events_decoded, r.error.as_ref().map(|e| sniper_core::doctor::scrub(e, &secrets)).unwrap_or_default());
+    }
+    println!("JUP configured={} ok={} {}", rep.jupiter.configured, rep.jupiter.ok, rep.jupiter.error.clone().unwrap_or_default());
+    println!("PumpSwap coverage: {}", rep.pumpswap_coverage);
+    println!("recommended SOLANA_STREAM_KIND: {}", rep.recommended_stream_kind.clone().unwrap_or("-".into()));
+    for p in &rep.problems {
+        println!("PROBLEM: {p}");
+    }
+    println!("READY FOR LIVE: {}", rep.ready_for_live);
+    println!("NEXT: {}", rep.next_action);
+    println!("report: {}", path.display());
+    Ok(())
+}
+
+async fn calibrate(profile: &str) -> anyhow::Result<()> {
+    let pg = PgStore::connect(&db_url()?, profile).await?;
+    // calibration split only (even UTC days), live data only, 120s horizon
+    let rows = pg
+        .client
+        .query(
+            "select (doc->>'expected_move_bps')::float8 as em, net_return from forward_outcomes
+             where profile_key=$1 and profile_key like 'LIVE:%' and horizon_s=120 and net_return is not null
+               and doc ? 'expected_move_bps' and ((t0_us / 86400000000) % 2) = 0",
+            &[&profile],
+        )
+        .await?;
+    let mut v: Vec<(f64, f64)> = rows.iter().filter_map(|r| Some((r.get::<_, Option<f64>>(0)?, r.get::<_, Option<f64>>(1)?))).collect();
+    let min = EngineConfig::default().evidence.min_outcomes_for_calibration as usize;
+    println!("calibration split (even UTC days), LIVE only, 120s horizon: {} outcomes (need ≥ {min})", v.len());
+    if v.len() < min {
+        println!("INSUFFICIENT EVIDENCE — expected-move model stays UNCALIBRATED. Keep collecting live data.");
+        return Ok(());
+    }
+    v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    println!("{:>14} {:>14} {:>16} {:>8}", "predicted bps", "realized bps", "realized − pred", "n");
+    for chunk in v.chunks(v.len().div_ceil(5)) {
+        let p = chunk.iter().map(|x| x.0).sum::<f64>() / chunk.len() as f64;
+        let r = chunk.iter().map(|x| x.1 * 10_000.0).sum::<f64>() / chunk.len() as f64;
+        println!("{p:>14.0} {r:>14.0} {:>16.0} {:>8}", r - p, chunk.len());
+    }
+    let (sp, sr): (f64, f64) = v.iter().fold((0.0, 0.0), |a, x| (a.0 + x.0, a.1 + x.1 * 10_000.0));
+    println!("suggested expected_move_scale_bps multiplier (calibration split only): {:.3}", if sp > 0.0 { sr / sp } else { 0.0 });
+    println!("This is NOT applied. Evaluate any change only on the holdout split (odd UTC days) collected afterwards.");
     Ok(())
 }

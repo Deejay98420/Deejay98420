@@ -41,7 +41,10 @@ Realized P&L is computed as proceeds − exit tx costs − failed-exit fees − 
 
 ## Measurement caveats
 
-- **Execution checks** compare our simulated fill with the *next* same-side market trade within 5 s. In a trending market this is biased: in a pump, later buys pay more, so our buys look better. Sizes also differ. Read it as a sanity bound, not as slippage.
+- **Execution checks** compare our simulated fill with the latest same-side market trade at or before the fill (within 5 s), recording trade age and size ratio. v1.1 used the next trade, which looked ahead and biased trending markets; that is removed. Sizes still differ, so this is a consistency bound, not slippage. Fills are never priced from market trades.
+- **Fill evidence.** Fills are simulated from venue reserves at fill time, or conservatively capped by a fresh live Jupiter quote. Landing latency is a configured per-scenario estimate added after the measured pipeline delay; real landing latency cannot be measured without sending transactions. Fills are **validated** only with LIVE data, a mainnet-verified venue decoder, state at most 2 s old, and on-chain-observed fee rates. Everything else is **unverified** and excluded from validated metrics.
+- **Calibration discipline.** A fixed chronological split is used: even UTC days are calibration, odd days are holdout. Thresholds may only be tuned on calibration data; `calibrate` enforces this and never writes config. Reported evidence is validated holdout only.
+- **Sensitivity** re-costs closed trades under harsher venue fees (×1.5, ×2), extra slippage per side (+50/100/200 bps) and priority fees (×2, ×5).
 - **Forward evaluation** uses a 0.05 SOL probe quoted at decision time, with no latency or failures, and fixed costs of two base-scenario transactions. It is an opportunity measure, not a P&L.
 - **The expected-move model** (`expected_move_scale_bps`) is an uncalibrated heuristic prior. Calibrate it against forward outcomes before trusting `min_net_edge_bps`.
 

@@ -65,6 +65,36 @@ fn commitment_str(c: Commitment) -> &'static str {
     }
 }
 
+/// Subscription methods keyed by request id (for capability checks).
+pub fn subscribe_methods(cfg: &WsConfig) -> Vec<(u64, &'static str, bool /*primary*/)> {
+    let mut v: Vec<(u64, &'static str, bool)> = match &cfg.kind {
+        SubscriptionKind::Logs { mentions } => (0..mentions.len()).map(|i| (i as u64 + 1, "logsSubscribe", true)).collect(),
+        SubscriptionKind::Transactions { .. } => vec![(1, "transactionSubscribe", true)],
+    };
+    if cfg.tip {
+        v.push((900, "slotSubscribe", false));
+    }
+    if cfg.slot_updates {
+        v.push((901, "slotsUpdatesSubscribe", false));
+    }
+    v
+}
+
+/// Classify a JSON-RPC response to a subscription request: Some((id, ok, detail)).
+pub fn parse_ack(text: &str) -> Option<(u64, bool, String)> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    let id = v.get("id")?.as_u64()?;
+    if v.get("method").is_some() {
+        return None;
+    }
+    if let Some(e) = v.get("error") {
+        let msg = e.get("message").and_then(|m| m.as_str()).unwrap_or("error");
+        let code = e.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+        return Some((id, false, format!("{code}: {}", msg.chars().take(120).collect::<String>())));
+    }
+    v.get("result").map(|r| (id, true, format!("subscription id {r}")))
+}
+
 pub fn subscribe_requests(cfg: &WsConfig) -> Vec<String> {
     let c = commitment_str(cfg.commitment);
     let mut out: Vec<String> = match &cfg.kind {
@@ -233,7 +263,10 @@ async fn session(cfg: &WsConfig, ingestor: &Ingestor, got_data: &mut bool, fetch
     }
     let mut ping = tokio::time::interval(cfg.ping_interval);
     ping.tick().await;
-    let mut subscribed = false;
+    let methods = subscribe_methods(cfg);
+    let mut primary_pending = methods.iter().filter(|m| m.2).count();
+    let mut primary_ok = 0usize;
+    let mut acked: std::collections::HashSet<u64> = Default::default();
     loop {
         tokio::select! {
             _ = ping.tick() => { ws.send(Message::Ping(vec![])).await?; }
@@ -246,9 +279,24 @@ async fn session(cfg: &WsConfig, ingestor: &Ingestor, got_data: &mut bool, fetch
                 match msg {
                     Message::Text(t) => {
                         let recv = wall_us();
-                        if !subscribed && t.contains("\"result\"") && t.contains("\"id\"") {
-                            subscribed = true;
-                            let _ = ingestor.push(ingestor.connection(&cfg.provider, ConnState::Subscribed, "subscription ack")).await;
+                        if let Some((id, ok, detail)) = parse_ack(&t) {
+                            if let Some((_, method, primary)) = methods.iter().find(|m| m.0 == id) {
+                                if acked.insert(id) {
+                                    let _ = ingestor.push(StreamMsg::Capability { provider: cfg.provider.clone(), method: method.to_string(), ok, detail: detail.clone(), recv_us: recv }).await;
+                                    if *primary {
+                                        primary_pending -= 1;
+                                        if ok {
+                                            primary_ok += 1;
+                                            if primary_ok == 1 {
+                                                let _ = ingestor.push(ingestor.connection(&cfg.provider, ConnState::Subscribed, format!("{method} accepted"))).await;
+                                            }
+                                        } else if primary_pending == 0 && primary_ok == 0 {
+                                            anyhow::bail!("provider rejected {method}: {detail}");
+                                        }
+                                    }
+                                }
+                            }
+                            continue;
                         }
                         match parse_message(&t, &cfg.provider, cfg.commitment, recv) {
                             Some(Parsed::Event(ev)) => {

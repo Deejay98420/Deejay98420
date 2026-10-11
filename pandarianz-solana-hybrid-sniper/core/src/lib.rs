@@ -17,6 +17,8 @@ pub mod live;
 pub mod feed;
 pub mod forward;
 pub mod execcheck;
+pub mod doctor;
+pub mod verify;
 pub mod state;
 pub mod store;
 pub mod strategy;

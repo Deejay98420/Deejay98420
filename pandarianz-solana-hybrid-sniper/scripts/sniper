@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # One-command local workflow (macOS / Linux, bash 3.2 compatible). PAPER ONLY.
-#   ./scripts/sniper setup | start [fixture|live] [--profile NAME] | stop [--db] | status | test | report [PROFILE_KEY]
-#                    | replay PROFILE_KEY | verify-live [SECONDS] | capture [N] | logs | db-up | db-down
+#   ./scripts/sniper check                      ← one command: environment, tests, providers, decoders, next action
+#   ./scripts/sniper setup | env-check | doctor [SECS] | capture [N] | verify-decoders | verify-live [SECS]
+#                    | start [fixture|live] [--profile NAME] | restart | stop [--db] | status | report [PROFILE_KEY]
+#                    | calibrate [PROFILE_KEY] | replay PROFILE_KEY | test | logs | db-up | db-down
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN="$ROOT/.run"
@@ -83,6 +85,7 @@ cmd_start() {
   [ -n "$profile" ] || profile="$( [ "$mode" = live ] && echo main || echo "run$(date +%s)")"
   local key; key="$( [ "$mode" = live ] && echo "LIVE:$profile" || echo "FIXTURE:$profile")"
   echo "$key" > "$RUN/profile"
+  echo "$mode $profile" > "$RUN/last_start"
   local fx=()
   [ "$mode" = fixture ] && [ -f "$ROOT/fixtures/synthetic/hybrid_session.jsonl" ] && fx=(--fixture "$ROOT/fixtures/synthetic/hybrid_session.jsonl")
   say "starting engine: mode=$mode profile=$key api=$SNIPER_API_ADDR (PAPER ONLY)"
@@ -172,6 +175,85 @@ cmd_capture() {
   (cd "$CORE" && cargo test --quiet --test real_fixtures -- --nocapture 2>&1 | grep -E "FIXTURES|test result")
 }
 
+has_live_urls() {
+  local u="${SOLANA_WS_URLS:-}${SOLANA_WS_URL:-}"
+  [ -n "$u" ] && case "$u" in *"<"*) return 1 ;; *) return 0 ;; esac
+}
+
+# Environment & dependency verification. Prints OK/MISSING lines; returns non-zero on blockers.
+cmd_env_check() {
+  local fail=0
+  chk() { if command -v "$1" >/dev/null 2>&1; then say "OK      $1 ($($1 --version 2>/dev/null | head -1))"; else say "MISSING $1 — $2"; [ "${3:-req}" = req ] && fail=1; fi; }
+  chk cargo "install Rust: https://rustup.rs"
+  chk node "install Node 20+: https://nodejs.org (or brew install node)"
+  chk npm "comes with Node"
+  chk docker "Docker Desktop (or set DATABASE_URL to an existing PostgreSQL 14+)" opt
+  chk git "xcode-select --install"
+  if [ -f "$ROOT/.env" ]; then say "OK      .env present (values are never printed)"; else say "MISSING .env — run ./scripts/sniper setup (creates it from .env.example)"; fail=1; fi
+  if has_live_urls; then say "OK      SOLANA_WS_URLS configured"; else say "INFO    SOLANA_WS_URLS not configured → live checks will be skipped"; fi
+  if db_reachable; then say "OK      PostgreSQL reachable"; else say "INFO    PostgreSQL not reachable yet (start: ./scripts/sniper db-up)"; fi
+  return $fail
+}
+
+cmd_doctor() {
+  [ -x "$BIN" ] || build
+  has_live_urls || { say "SOLANA_WS_URLS not configured in .env — nothing to probe"; return 2; }
+  (cd "$CORE" && "$BIN" doctor --listen-seconds "${1:-20}" --out "$ROOT/reports")
+}
+
+cmd_verify_decoders() {
+  [ -x "$BIN" ] || build
+  (cd "$CORE" && "$BIN" verify-fixtures --dir "$ROOT/fixtures/real")
+  (cd "$CORE" && cargo test --quiet --test real_fixtures --test idl_verification 2>&1 | grep -E "FIXTURES|test result")
+}
+
+cmd_restart() {
+  local mode profile
+  read -r mode profile < "$RUN/last_start" 2>/dev/null || die "no previous start recorded"
+  cmd_stop
+  say "restarting $mode profile $profile (positions, balances and dedup state are recovered from PostgreSQL)"
+  cmd_start "$mode" --profile "$profile"
+}
+
+# One command: environment → tests → providers → real-transaction capture/verification → next action.
+cmd_check() {
+  local next=""
+  say "== 1/5 environment"
+  cmd_env_check || next="Install the missing dependencies listed above, then rerun ./scripts/sniper check"
+  [ -f "$ROOT/.env" ] || { cp "$ROOT/.env.example" "$ROOT/.env"; say "created .env from template"; }
+  if [ -z "$next" ]; then
+    say "== 2/5 build + automated tests"
+    build
+    db_up >/dev/null 2>&1 || say "PostgreSQL unavailable — the PostgreSQL integration test will be skipped"
+    if (cd "$CORE" && cargo test --quiet 2>&1 | tee "$RUN/test.log" | grep -E "test result" | awk '{p+=$4; f+=$6} END {printf "[sniper] tests: %d passed, %d failed\n", p, f; exit (f>0)}'); then :; else next="Tests failed — see .run/test.log"; fi
+    "$ROOT/scripts/check_no_live.sh" >/dev/null && say "PAPER-only static safety check: OK" || next="Safety check failed — do not run"
+  fi
+  if [ -z "$next" ]; then
+    say "== 3/5 provider connectivity"
+    if has_live_urls; then
+      cmd_doctor 15 | tee "$RUN/doctor.log" | grep -E "^(WS|RPC|JUP|PumpSwap|recommended|PROBLEM|READY|NEXT)|REJECTED|accepted" || true
+      grep -q "READY FOR LIVE: true" "$RUN/doctor.log" || next="$(grep '^NEXT:' "$RUN/doctor.log" | sed 's/^NEXT: //')"
+    else
+      next="Add your provider WebSocket URL(s) to $ROOT/.env as SOLANA_WS_URLS=wss://… (keys stay local), then rerun ./scripts/sniper check"
+    fi
+  fi
+  if [ -z "$next" ]; then
+    say "== 4/5 real mainnet transaction capture + decoder validation"
+    cmd_capture 10 || true
+    cmd_verify_decoders || true
+    if grep -q '"pump_bonding_curve": true' "$ROOT/fixtures/real/verification.json" 2>/dev/null; then
+      say "mainnet decoder verification: Pump.fun curve VERIFIED"
+    else
+      next="Decoder verification incomplete — inspect fixtures/real/verification.json (FAIL lines above) before trusting live results"
+    fi
+  fi
+  say "== 5/5 summary"
+  if [ -z "$next" ]; then
+    next="Run: ./scripts/sniper start live --profile main   (dashboard http://127.0.0.1:3000), then ./scripts/sniper report LIVE:main after several days"
+  fi
+  printf '\n\033[1mNEXT REQUIRED ACTION:\033[0m %s\n' "$next"
+}
+
 case "${1:-help}" in
   setup) cmd_setup ;;
   start) shift; cmd_start "$@" ;;
@@ -181,9 +263,15 @@ case "${1:-help}" in
   report) shift; cmd_report "$@" ;;
   replay) shift; cmd_replay "$@" ;;
   verify-live) shift; cmd_verify_live "$@" ;;
+  check) cmd_check ;;
+  env-check) cmd_env_check ;;
+  doctor) shift; cmd_doctor "$@" ;;
+  verify-decoders) cmd_verify_decoders ;;
+  restart) cmd_restart ;;
+  calibrate) shift; [ -x "$BIN" ] || build; (cd "$CORE" && "$BIN" calibrate --profile "${1:-LIVE:main}") ;;
   capture) shift; cmd_capture "$@" ;;
   logs) tail -n 100 -f "$RUN/engine.log" ;;
   db-up) db_up ;;
   db-down) (cd "$ROOT" && docker compose stop postgres) ;;
-  *) sed -n '2,3p' "$0" ;;
+  *) sed -n '2,6p' "$0" ;;
 esac

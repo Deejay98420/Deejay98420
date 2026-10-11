@@ -53,6 +53,49 @@ pub struct Verification {
     pub evidence: &'static str,
 }
 
+/// Verification table including real-transaction results when a summary is available.
+pub fn verification_with(summary: Option<&crate::verify::VerificationSummary>) -> Vec<VerificationRow> {
+    let mut rows: Vec<VerificationRow> = verification()
+        .into_iter()
+        .filter(|v| v.item != "captured mainnet transactions")
+        .map(|v| {
+            let key = format!("{}/{}", v.venue, v.item);
+            let real = summary.and_then(|s| s.items.get(&key));
+            VerificationRow {
+                venue: v.venue.into(),
+                item: v.item.into(),
+                status: match real {
+                    Some(r) if r.mainnet_verified => "mainnet_verified".into(),
+                    Some(r) if r.hard_checks_failed > 0 => "MAINNET_MISMATCH".into(),
+                    _ => v.status.into(),
+                },
+                evidence: match real {
+                    Some(r) => format!("{} real txs / {} events; hard checks {} passed, {} failed. {}", r.transactions, r.events, r.hard_checks_passed, r.hard_checks_failed, v.evidence),
+                    None => v.evidence.into(),
+                },
+            }
+        })
+        .collect();
+    rows.push(VerificationRow {
+        venue: "all".into(),
+        item: "captured mainnet transactions".into(),
+        status: match summary {
+            Some(s) if s.files > 0 => format!("{} captured", s.files),
+            _ => "pending".into(),
+        },
+        evidence: "`sniper capture` + `sniper verify-fixtures` (fixtures/real/verification.json)".into(),
+    });
+    rows
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct VerificationRow {
+    pub venue: String,
+    pub item: String,
+    pub status: String,
+    pub evidence: String,
+}
+
 pub fn verification() -> Vec<Verification> {
     const PUMP: &str = "official IDL @pump-fun/pump-sdk@4.0.0 (tests/idl_verification.rs); math vs SDK bondingCurve.ts";
     const AMM: &str = "official IDL @pump-fun/pump-swap-sdk@2.1.0 (tests/idl_verification.rs); math vs SDK buy.ts/sell.ts";

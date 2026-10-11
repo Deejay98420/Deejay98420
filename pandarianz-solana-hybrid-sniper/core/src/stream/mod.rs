@@ -76,6 +76,8 @@ pub enum StreamMsg {
     Connection { provider: String, state: ConnState, detail: String, recv_us: i64 },
     /// Chain tip observed by a provider (slotSubscribe): used for slot lag and feed liveness.
     Tip { provider: String, slot: u64, recv_us: i64 },
+    /// Result of a subscription request (explicit capability check per provider and method).
+    Capability { provider: String, method: String, ok: bool, detail: String, recv_us: i64 },
     /// End of a finite source (fixture file).
     End { provider: String, recv_us: i64 },
 }
@@ -121,7 +123,8 @@ impl StreamMsg {
             StreamMsg::Slot { recv_us, .. }
             | StreamMsg::Connection { recv_us, .. }
             | StreamMsg::End { recv_us, .. }
-            | StreamMsg::Tip { recv_us, .. } => *recv_us,
+            | StreamMsg::Tip { recv_us, .. }
+            | StreamMsg::Capability { recv_us, .. } => *recv_us,
         }
     }
 }

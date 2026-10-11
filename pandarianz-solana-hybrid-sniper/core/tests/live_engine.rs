@@ -250,6 +250,7 @@ fn conservative_fill_uses_the_worse_of_simulation_and_live_aggregator_quote() {
             observed_quote: None,
             fill_basis: None,
             aggregator_divergence_bps: None,
+            evidence: None,
         };
         o.observed_quote = obs;
         o
@@ -274,7 +275,7 @@ fn conservative_fill_uses_the_worse_of_simulation_and_live_aggregator_quote() {
 }
 
 #[test]
-fn execution_checks_compare_with_the_next_real_trade() {
+fn execution_checks_never_look_ahead() {
     let mut x = ExecChecker::new(5.0);
     let mint = Pubkey::synthetic("m");
     let mut o = sniper_core::paper::Order {
@@ -308,16 +309,25 @@ fn execution_checks_compare_with_the_next_real_trade() {
         observed_quote: None,
         fill_basis: None,
         aggregator_divergence_bps: None,
+        evidence: None,
     };
-    x.add(&o, 10 * S);
-    let t = |ts: i64, is_buy: bool| TradeObs { ts_us: ts, slot: 1, user: wallet("u"), is_buy, sol: 100, tokens: 100, price_after: 1.0, venue: Venue::PumpBondingCurve, user_quote: 100 };
-    assert!(x.on_trade(&mint, &t(11 * S, false)).is_empty(), "opposite side ignored");
-    let r = x.on_trade(&mint, &t(12 * S, true));
-    assert_eq!(r.len(), 1);
-    assert!((r[0].adverse_bps.unwrap() - 1000.0).abs() < 1e-6, "we paid 1.10 vs market 1.00 → +1000 bps");
+    let t = |ts: i64, is_buy: bool, quote: u64| TradeObs { ts_us: ts, slot: 1, user: wallet("u"), is_buy, sol: quote, tokens: 100, price_after: 1.0, venue: Venue::PumpBondingCurve, user_quote: quote };
+    let mut trades = std::collections::VecDeque::new();
+    trades.push_back(t(8 * S, true, 100)); // prior buy at 1.00/token
+    trades.push_back(t(9 * S, false, 90)); // prior sell (other side)
+    trades.push_back(t(11 * S, true, 150)); // FUTURE buy at 1.50 — must never be used
+    let c = x.check(&o, 10 * S, &trades).unwrap();
+    assert_eq!(c.outcome, "compared_prior");
+    assert!((c.market_price.unwrap() - 1.0).abs() < 1e-9, "uses the latest PRIOR same-side trade, never a future one");
+    assert!((c.adverse_bps.unwrap() - 1000.0).abs() < 1e-6, "we paid 1.10 vs prior market 1.00 → +1000 bps");
+    assert_eq!(c.market_trade_age_ms, Some(2000.0));
+    // only a future trade exists → no comparison at all
+    let only_future: std::collections::VecDeque<_> = [t(11 * S, true, 150)].into_iter().collect();
+    assert_eq!(x.check(&o, 10 * S, &only_future).unwrap().outcome, "no_prior_trade");
+    // too old for the window
+    let stale: std::collections::VecDeque<_> = [t(2 * S, true, 100)].into_iter().collect();
+    assert_eq!(x.check(&o, 10 * S, &stale).unwrap().outcome, "no_prior_trade");
     o.order_id = "o2".into();
-    x.add(&o, 20 * S);
-    assert_eq!(x.expire(26 * S)[0].outcome, "no_comparable_trade");
 }
 
 #[tokio::test]

@@ -1,4 +1,4 @@
-# pandarianz-solana-hybrid-sniper (v1.1)
+# pandarianz-solana-hybrid-sniper (v1.2)
 
 A **PAPER-ONLY** Solana memecoin launch sniper and momentum trader. It has an event-driven Rust core, PostgreSQL persistence with a replayable journal, and a read-only Next.js dashboard.
 
@@ -28,7 +28,12 @@ Other commands:
 | `start live` | Live provider stream. Needs `SOLANA_WS_URL` in `.env`; refuses to start without it. |
 | `replay PROFILE_KEY` | Re-run a recorded journal through the current strategy as `REPLAY` data. |
 | `verify-live [SECONDS]` | Connect to your live providers, then write a validation report to `reports/`: connectivity, decode coverage, measured latency, feed health. |
-| `capture [N]` | Capture N recent real mainnet transactions per program into `fixtures/real/`, then run the real-fixture decoder checks. |
+| `capture [N]` | Capture a diverse sample of real mainnet transactions (launches, trades, completions, migrations, swaps) into `fixtures/real/`, then verify them. |
+| `check` | One-command environment → tests → providers → decoders → next action. |
+| `env-check` / `doctor [SECS]` | Dependency check / provider connectivity and capability diagnostics. |
+| `verify-decoders` | Re-verify `fixtures/real/` against transaction evidence and run the decoder test suites. |
+| `restart` | Stop and start the last mode and profile. Positions, balances and dedup state are recovered from PostgreSQL. |
+| `calibrate [PROFILE_KEY]` | Calibration-split analysis of the expected-move model (read-only). |
 | `logs` | Tail the engine log. |
 | `db-up` / `db-down` | Start or stop the Docker PostgreSQL. |
 
@@ -65,6 +70,48 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the modules and [docs/ASSUM
 10. **Tests.** 57 tests plus 1 ignored diagnostic; see below.
 11. **Safety.** Static source and dependency scans, GET-only API checks, and a `.env.example` placeholder check.
 12. **Tooling.** `scripts/sniper` (bash 3.2 compatible), `.env.example` with placeholders, and `docker-compose.yml` for PostgreSQL.
+
+## One command (Mac)
+
+```bash
+./scripts/sniper check
+```
+
+`check` runs these steps in order:
+
+1. Verifies tools and `.env` (values are never printed).
+2. Builds the project and runs every automated test plus the PAPER-only safety check.
+3. Probes each configured provider with `doctor`: connection, which subscriptions are accepted or rejected, and PumpSwap coverage.
+4. Captures real mainnet transactions and verifies the decoders against transaction evidence.
+5. Prints the **single next required action**.
+
+## V1.2: real-data evidence
+
+- **`doctor`** gives an explicit capability check for every provider: `logsSubscribe` per program, `transactionSubscribe` (and whether its notifications carry inner instructions), `slotSubscribe`, `slotsUpdatesSubscribe`. It also checks RPC `getTransaction` decode of real Pump.fun and PumpSwap transactions and Jupiter quote availability, then recommends `SOLANA_STREAM_KIND`. Reports go to `reports/doctor-*.json` with every URL, path segment and key scrubbed. The live engine records the same per-provider subscription results and never reports a provider as subscribed unless its primary subscription was accepted.
+- **Decoder verification against transaction evidence** (`capture` → `verify-fixtures`). Every decoded event is cross-checked against independent data in the same transaction:
+  - per-owner token-balance deltas (amount and direction)
+  - token conservation
+  - pool vault deltas
+  - per-component fee arithmetic
+  - the curve invariant
+  - SOL deltas (a soft check)
+
+  Captures keep their signature, slot and block time, and are classified as launch, trade, curve completion, migration, pool creation, swap or liquidity. A layout counts as **mainnet-verified** only with at least 5 events and zero hard-check failures. The engine reads `fixtures/real/verification.json`.
+- **Execution realism.** The v1.1 next-trade comparison used a future trade. It now compares only with the latest same-side trade **at or before** the fill. Every fill is classified **validated** or **unverified**, with reasons. Validated requires:
+  - LIVE data
+  - a mainnet-verified decoder for the venue
+  - venue state at most 2 s old at fill
+  - fee rates observed on-chain
+
+  A position is validated only if both of its fills are. Unverified fills never count toward validated P&L.
+- **Profitability evidence.**
+  - Validated vs unverified P&L.
+  - A fixed chronological split: even UTC days are calibration, odd days are holdout. Only **validated holdout** figures are presented as evidence. `calibrate` reads the calibration split only and never changes config.
+  - Results by strategy × trade size.
+  - Execution failure rate and unresolved positions.
+  - Quote freshness at decision and at fill.
+  - Fee / slippage / priority-fee sensitivity.
+  - The expected-move model stays labelled **UNCALIBRATED** until at least 1,000 live calibration-split outcomes exist.
 
 ## Going live (data only, PAPER trading)
 
@@ -108,7 +155,13 @@ The IDL check found and fixed real issues relative to v1.0:
 
 ## Tests
 
-`./scripts/sniper test` runs 87 tests, plus the static check and the dashboard typecheck/build:
+`./scripts/sniper test` runs 98 tests, plus the static check and the dashboard typecheck/build. V1.2 adds:
+
+- `v12_evidence` (9): transaction-evidence verification of curve trades and PumpSwap swaps, including that tampered events are caught; the mainnet-verified summary; explicit subscription capability checks (a rejected `transactionSubscribe` never reports "Subscribed"); doctor probes against mock providers with key scrubbing; fixture fills never validating; validated-fill rules; sensitivity monotonicity; the fixed split; and the end-to-end `capture` CLI with provenance and no key leakage.
+- Unit tests: secret scrubbing (found and fixed a leak of key-bearing path segments) and the doctor assessment.
+- `live_engine`: the execution check proven never to look ahead.
+
+V1.1 suites:
 
 - `idl_verification` (8): decoders vs. the official IDLs, including full new tails, the signed i128 offset, and account discriminators.
 - `live_pipeline` (1): full LIVE mode against local mock providers. Covers dead-provider failover, chain tip, logs → `getTransaction` PumpSwap fetch, startup backfill, pool discovery, mint checks, a read-only RPC method audit, and the feed reaching HEALTHY.

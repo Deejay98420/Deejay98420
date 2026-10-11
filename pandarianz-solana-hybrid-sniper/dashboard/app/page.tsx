@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import type { BookView, Candidate, Position, Reason, Snapshot } from "../lib/types";
+import type { BookView, Candidate, PerfStats, Position, Reason, Sensitivity, Snapshot } from "../lib/types";
 import { PnlChart } from "./PnlChart";
 
 const POLL_MS = 2000;
@@ -106,6 +106,29 @@ export default function Page() {
             </div>
           </section>
 
+          <section className="card span-12">
+            <h2>Profitability evidence — {book.scenario}</h2>
+            <div className="tiles">
+              <Tile label="Validated holdout P&L" value={signed(book.perf_validated_holdout.realized_pnl_sol)} tone={book.perf_validated_holdout.realized_pnl_sol} sub={`${book.perf_validated_holdout.closed_trades} trades · the only figure to read as evidence`} />
+              <Tile label="Validated P&L (all splits)" value={signed(book.perf_validated.realized_pnl_sol)} tone={book.perf_validated.realized_pnl_sol} sub={`${book.perf_validated.closed_trades} trades · calibration ${book.perf_validated_calibration.closed_trades}`} />
+              <Tile label="Unverified P&L" value={signed(book.perf_unverified.realized_pnl_sol)} sub={`${book.perf_unverified.closed_trades} trades · NOT evidence`} />
+              <Tile label="Execution failure rate" value={pct(book.execution_failure_rate)} sub="dropped + slippage fails + no route" />
+              <Tile label="Unresolved positions" value={String(book.unresolved_positions)} tone={book.unresolved_positions ? -1 : null} sub="valued at 0" />
+              <Tile label="Expected-move model" value={snap.expected_move_model_status.split(" — ")[0]} sub={snap.expected_move_model_status.split(" — ")[1] ?? ""} />
+            </div>
+            <p className="empty" style={{ fontStyle: "normal" }}>A fill is <b>validated</b> only on LIVE data, with a decoder verified against captured mainnet transactions, venue state ≤ 2 s old at fill and fee rates observed on-chain. Positions count as validated only if entry and exit both validate. Holdout = odd UTC days; thresholds may only be tuned on calibration days.</p>
+            <div className="grid" style={{ marginTop: 8 }}>
+              <div className="span-6" style={{ minWidth: 0 }}>
+                <h2>By strategy and size</h2>
+                <PerfTable rows={book.perf_by_path_size} />
+              </div>
+              <div className="span-6" style={{ minWidth: 0 }}>
+                <h2>Fee &amp; slippage sensitivity (all closed trades)</h2>
+                <SensTable rows={book.sensitivity_all} />
+              </div>
+            </div>
+          </section>
+
           <section className="card span-8">
             <h2>Open & unresolved positions — {book.scenario}</h2>
             <Positions rows={book.open_positions} now={snap.generated_us} />
@@ -150,12 +173,14 @@ export default function Page() {
                   <Row k="last event" v={snap.feed_status.last_event_age_ms == null ? "–" : ms(snap.feed_status.last_event_age_ms * 1000) + " ago"} />
                   {snap.tx_fetch && <Row k="tx fetch (logs→getTransaction)" v={`${snap.tx_fetch.fetched}/${snap.tx_fetch.requested} · ${snap.tx_fetch.not_found} missing · mean ${snap.tx_fetch.mean_fetch_ms?.toFixed(0) ?? "–"} ms`} />}
                   {snap.backfill && <Row k="startup backfill" v={`${snap.backfill.transactions_loaded} txs in ${snap.backfill.duration_ms.toFixed(0)} ms`} />}
+                  {Object.entries(snap.coverage).map(([k, v]) => <Row key={k} k={`coverage ${k}`} v={v} />)}
                 </dl>
                 <div className="tablewrap" style={{ marginTop: 8 }}>
                   <table>
-                    <thead><tr><th>provider</th><th>state</th><th className="num">first deliveries</th><th className="num">reconnects</th><th className="num">tip</th></tr></thead>
+                    <thead><tr><th>provider</th><th>state</th><th className="num">first deliveries</th><th className="num">reconnects</th><th className="num">tip</th><th>subscriptions</th></tr></thead>
                     <tbody>{Object.entries(snap.providers).map(([k, p]) => (
-                      <tr key={k}><td>{k}</td><td>{p.state ?? "?"}</td><td className="num">{p.first_deliveries}</td><td className="num">{p.reconnects}</td><td className="num">{p.tip_slot ?? "–"}</td></tr>
+                      <tr key={k}><td>{k}</td><td>{p.state ?? "?"}</td><td className="num">{p.first_deliveries}</td><td className="num">{p.reconnects}</td><td className="num">{p.tip_slot ?? "–"}</td>
+                        <td style={{ whiteSpace: "normal" }}>{Object.entries(p.capabilities ?? {}).map(([m, v]) => <span key={m} className={`chip ${v.startsWith("accepted") ? "enter" : ""}`} title={v}>{m}: {v.startsWith("accepted") ? "ok" : "REJECTED"}</span>)}</td></tr>
                     ))}</tbody>
                   </table>
                 </div>
@@ -270,7 +295,7 @@ export default function Page() {
               <table>
                 <thead><tr><th>venue</th><th>item</th><th>status</th><th>evidence</th></tr></thead>
                 <tbody>{snap.decoder_verification.map((v, i) => (
-                  <tr key={i}><td>{v.venue}</td><td>{v.item}</td><td className={v.status === "idl_verified" ? "pos" : "warn"}>{v.status}</td><td style={{ whiteSpace: "normal" }}>{v.evidence}</td></tr>
+                  <tr key={i}><td>{v.venue}</td><td>{v.item}</td><td className={v.status === "mainnet_verified" ? "pos" : v.status === "idl_verified" ? "" : "warn"}>{v.status}</td><td style={{ whiteSpace: "normal" }}>{v.evidence}</td></tr>
                 ))}</tbody>
               </table>
             </div>
@@ -359,6 +384,37 @@ function Candidates({ rows }: { rows: Candidate[] }) {
             </tr>
           ))}
         </tbody>
+      </table>
+    </div>
+  );
+}
+
+function PerfTable({ rows }: { rows: Record<string, PerfStats> }) {
+  const e = Object.entries(rows ?? {});
+  if (!e.length) return <div className="empty">No closed trades yet.</div>;
+  return (
+    <div className="tablewrap">
+      <table>
+        <thead><tr><th>strategy@size</th><th className="num">trades</th><th className="num">win</th><th className="num">net SOL</th><th className="num">expectancy</th><th className="num">PF</th><th className="num">max DD</th></tr></thead>
+        <tbody>{e.map(([k, p]) => (
+          <tr key={k}><td>{k}</td><td className="num">{p.closed_trades}</td><td className="num">{pct(p.win_rate)}</td><td className={`num ${cls(p.realized_pnl_sol)}`}>{signed(p.realized_pnl_sol)}</td>
+            <td className={`num ${cls(p.expectancy_sol)}`}>{signed(p.expectancy_sol, 5)}</td><td className="num">{p.profit_factor == null ? "–" : p.profit_factor.toFixed(2)}</td><td className="num">{sol(p.max_drawdown_sol)}</td></tr>
+        ))}</tbody>
+      </table>
+    </div>
+  );
+}
+
+function SensTable({ rows }: { rows: Sensitivity[] }) {
+  if (!rows?.length || rows[0].trades === 0) return <div className="empty">No closed trades yet.</div>;
+  return (
+    <div className="tablewrap">
+      <table>
+        <thead><tr><th>assumption</th><th className="num">net SOL</th><th className="num">expectancy</th><th className="num">PF</th><th className="num">win</th></tr></thead>
+        <tbody>{rows.map((r) => (
+          <tr key={r.label}><td>{r.label}</td><td className={`num ${cls(r.net_sol)}`}>{signed(r.net_sol)}</td><td className={`num ${cls(r.expectancy_sol)}`}>{signed(r.expectancy_sol, 5)}</td>
+            <td className="num">{r.profit_factor == null ? "–" : r.profit_factor.toFixed(2)}</td><td className="num">{pct(r.win_rate)}</td></tr>
+        ))}</tbody>
       </table>
     </div>
   );

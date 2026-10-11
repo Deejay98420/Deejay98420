@@ -62,6 +62,7 @@ fn entry_order(c: &Curve, q: sniper_core::quote::Quote, tol: u32, amount: u64) -
         observed_quote: None,
         fill_basis: None,
         aggregator_divergence_bps: None,
+        evidence: None,
     }
 }
 

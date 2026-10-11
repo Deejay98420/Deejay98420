@@ -22,6 +22,10 @@ pub struct Probe {
     pub entry_in: u64,
     pub tokens: u64,
     pub horizons_s: Vec<u32>,
+    #[serde(default)]
+    pub expected_move_bps: Option<f64>,
+    #[serde(default)]
+    pub data_mode: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -41,6 +45,13 @@ pub struct ForwardOutcome {
     pub net_lamports: Option<i64>,
     pub net_return: Option<f64>,
     pub note: String,
+    #[serde(default)]
+    pub expected_move_bps: Option<f64>,
+    #[serde(default)]
+    pub data_mode: String,
+    /// "calibration" | "holdout" (fixed by decision time; see metrics::evidence_split)
+    #[serde(default)]
+    pub split: String,
 }
 
 pub struct ForwardTracker {
@@ -100,6 +111,9 @@ impl ForwardTracker {
                     net_lamports: net,
                     net_return: net.map(|n| n as f64 / p.entry_in.max(1) as f64),
                     note,
+                    expected_move_bps: p.expected_move_bps,
+                    data_mode: p.data_mode.clone(),
+                    split: crate::metrics::evidence_split(p.t0_us).to_string(),
                 });
             }
             p.horizons_s = keep;
@@ -122,7 +136,7 @@ pub struct ForwardBucket {
 pub fn summarize(outcomes: &VecDeque<ForwardOutcome>) -> BTreeMap<String, ForwardBucket> {
     let mut groups: BTreeMap<String, (u64, Vec<f64>)> = BTreeMap::new();
     for o in outcomes {
-        let mut keys = vec![format!("{}:{}@{}s", o.path, o.decision, o.horizon_s)];
+        let mut keys = vec![format!("{}:{}@{}s", o.path, o.decision, o.horizon_s), format!("{}|{}:{}@{}s", o.split, o.path, o.decision, o.horizon_s)];
         if o.decision == "reject" {
             for c in &o.reason_codes {
                 keys.push(format!("reject:{c}@{}s", o.horizon_s));
@@ -151,4 +165,18 @@ pub fn summarize(outcomes: &VecDeque<ForwardOutcome>) -> BTreeMap<String, Forwar
             (k, b)
         })
         .collect()
+}
+
+/// Calibration status of the heuristic expected-move model. Only LIVE outcomes in the CALIBRATION
+/// split count; synthetic data never does.
+pub fn expected_move_status(outcomes: &VecDeque<ForwardOutcome>, live: bool, min_n: u64) -> String {
+    if !live {
+        return "UNCALIBRATED — offline data never counts toward calibration".into();
+    }
+    let n = outcomes.iter().filter(|o| o.split == "calibration" && o.data_mode == "LIVE" && o.net_return.is_some()).count() as u64;
+    if n < min_n {
+        format!("UNCALIBRATED — {n} live calibration-split outcomes (need ≥ {min_n}); run `sniper calibrate` when enough exist")
+    } else {
+        format!("ENOUGH DATA TO CALIBRATE — {n} live calibration-split outcomes; review `sniper calibrate` (changes are never applied automatically)")
+    }
 }
