@@ -310,7 +310,7 @@ cmd_check() {
     grep -E "^(DECODER|  [a-z_]+ +[A-Z_]+ |VENUES|report:)" "$final" || cat "$final"
     verdict="$(grep '^VENUES MAINNET-VERIFIED' "$final" || true)"
     case "$verdict" in
-      *"pump_bonding_curve=YES"*"pumpswap=YES"*) next="Both venues mainnet-verified. Run: ./scripts/sniper start live --profile main (dashboard http://127.0.0.1:3000; PAPER only)" ;;
+      *"pump_bonding_curve=YES"*"pumpswap=YES"*) next="Both venue DECODERS are mainnet-verified (decoding/accounting only — no trade was executed and nothing is known about profitability). Optional next step, still PAPER only: ./scripts/sniper start live --profile main (dashboard http://127.0.0.1:3000)" ;;
       *"pump_bonding_curve=YES"*) next="Pump.fun decoders are mainnet-verified (PAPER fills on Pump.fun can be classified validated; still simulated, never executed). PumpSwap stays UNVERIFIED until it has real samples — optional bounded capture: ./scripts/sniper capture-pumpswap 20 60 300 1" ;;
       *"YES"*) next="Only some venues are mainnet-verified (see above): fills on the others stay UNVERIFIED. Inspect reports/verification/verification-detail.json, or capture more with: ./scripts/sniper check --capture 25" ;;
       *) if [ "$offline" = 1 ]; then

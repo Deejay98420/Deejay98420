@@ -65,6 +65,24 @@ pub struct Swap {
     /// signed virtual quote reserves (current IDL); None on older layouts
     #[serde(default)]
     pub virtual_quote_reserves: Option<i128>,
+    /// fee accounts named by the event itself (current IDL)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_fee_recipient: Option<Pubkey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_fee_recipient_token_account: Option<Pubkey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_base_token_account: Option<Pubkey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_quote_token_account: Option<Pubkey>,
+    /// cashback / buyback slices (current IDL): the buyback slice is part of the protocol fee
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cashback_fee_bps: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cashback: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buyback_fee_bps: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buyback_fee: Option<u64>,
 }
 
 impl Swap {
@@ -103,30 +121,47 @@ pub enum PumpSwapEvent {
 
 /// Fields after `user` common to the current Buy/Sell layouts up to the coin-creator fee.
 struct SwapAccountsTail {
+    user_base_token_account: Pubkey,
+    user_quote_token_account: Pubkey,
+    protocol_fee_recipient: Pubkey,
+    protocol_fee_recipient_token_account: Pubkey,
     coin_creator: Pubkey,
     coin_creator_fee_bps: u64,
     coin_creator_fee: u64,
 }
 
 fn swap_accounts_tail(r: &mut Reader) -> Result<SwapAccountsTail, DecodeError> {
-    r.skip(32 * 4)?; // user base/quote token accounts, protocol fee recipient + its token account
-    Ok(SwapAccountsTail { coin_creator: r.pubkey()?, coin_creator_fee_bps: r.u64()?, coin_creator_fee: r.u64()? })
+    Ok(SwapAccountsTail {
+        user_base_token_account: r.pubkey()?,
+        user_quote_token_account: r.pubkey()?,
+        protocol_fee_recipient: r.pubkey()?,
+        protocol_fee_recipient_token_account: r.pubkey()?,
+        coin_creator: r.pubkey()?,
+        coin_creator_fee_bps: r.u64()?,
+        coin_creator_fee: r.u64()?,
+    })
 }
 
-fn buy_virtual_tail(r: &mut Reader) -> Result<i128, DecodeError> {
+/// cashback_fee_basis_points, cashback, buyback_fee_basis_points, buyback_fee, virtual_quote_reserves
+struct FeeTail {
+    cashback_fee_bps: u64,
+    cashback: u64,
+    buyback_fee_bps: u64,
+    buyback_fee: u64,
+    virtual_quote_reserves: i128,
+}
+
+fn fee_tail(r: &mut Reader) -> Result<FeeTail, DecodeError> {
+    Ok(FeeTail { cashback_fee_bps: r.u64()?, cashback: r.u64()?, buyback_fee_bps: r.u64()?, buyback_fee: r.u64()?, virtual_quote_reserves: r.i128()? })
+}
+
+fn buy_fee_tail(r: &mut Reader) -> Result<FeeTail, DecodeError> {
     // track_volume, total_unclaimed_tokens, total_claimed_tokens, current_sol_volume,
-    // last_update_timestamp, min_base_amount_out, ix_name, cashback bps/amt, buyback bps/amt
+    // last_update_timestamp, min_base_amount_out, ix_name — then the shared fee tail
     r.bool()?;
     r.skip(8 * 5)?;
     r.string()?;
-    r.skip(8 * 4)?;
-    r.i128()
-}
-
-fn sell_virtual_tail(r: &mut Reader) -> Result<i128, DecodeError> {
-    // cashback bps/amt, buyback bps/amt
-    r.skip(8 * 4)?;
-    r.i128()
+    fee_tail(r)
 }
 
 pub fn decode(disc: [u8; 8], body: &[u8]) -> Result<Option<PumpSwapEvent>, DecodeError> {
@@ -204,13 +239,31 @@ pub fn decode(disc: [u8; 8], body: &[u8]) -> Result<Option<PumpSwapEvent>, Decod
             coin_creator_fee_bps: None,
             coin_creator_fee: None,
             virtual_quote_reserves: None,
+            protocol_fee_recipient: None,
+            protocol_fee_recipient_token_account: None,
+            user_base_token_account: None,
+            user_quote_token_account: None,
+            cashback_fee_bps: None,
+            cashback: None,
+            buyback_fee_bps: None,
+            buyback_fee: None,
         };
         let _ = quote_amount;
         if let Ok(t) = swap_accounts_tail(&mut r) {
             s.coin_creator = Some(t.coin_creator);
             s.coin_creator_fee_bps = Some(t.coin_creator_fee_bps);
             s.coin_creator_fee = Some(t.coin_creator_fee);
-            s.virtual_quote_reserves = if is_buy { buy_virtual_tail(&mut r).ok() } else { sell_virtual_tail(&mut r).ok() };
+            s.user_base_token_account = Some(t.user_base_token_account);
+            s.user_quote_token_account = Some(t.user_quote_token_account);
+            s.protocol_fee_recipient = Some(t.protocol_fee_recipient);
+            s.protocol_fee_recipient_token_account = Some(t.protocol_fee_recipient_token_account);
+            if let Ok(f) = if is_buy { buy_fee_tail(&mut r) } else { fee_tail(&mut r) } {
+                s.virtual_quote_reserves = Some(f.virtual_quote_reserves);
+                s.cashback_fee_bps = Some(f.cashback_fee_bps);
+                s.cashback = Some(f.cashback);
+                s.buyback_fee_bps = Some(f.buyback_fee_bps);
+                s.buyback_fee = Some(f.buyback_fee);
+            }
         }
         Ok(Some(PumpSwapEvent::Swap(s)))
     } else if disc == event_discriminator("DepositEvent") || disc == event_discriminator("WithdrawEvent") {
@@ -267,12 +320,14 @@ pub fn encode(ev: &PumpSwapEvent) -> Vec<u8> {
                 w.u64(lp).u64(s.lp_fee).u64(proto).u64(s.protocol_fee).u64(s.quote_amount_pool).u64(s.quote_amount_user);
             }
             w.pubkey(&s.pool).pubkey(&s.user);
-            w.bytes(&[0u8; 128]); // user token accounts + protocol fee recipient (+ token account)
+            for k in [&s.user_base_token_account, &s.user_quote_token_account, &s.protocol_fee_recipient, &s.protocol_fee_recipient_token_account] {
+                w.pubkey(&k.unwrap_or_default());
+            }
             w.pubkey(&s.coin_creator.unwrap_or_default()).u64(s.coin_creator_fee_bps.unwrap_or(0)).u64(s.coin_creator_fee.unwrap_or(0));
             if s.is_buy {
                 w.bool(false).u64(0).u64(0).u64(0).i64(0).u64(0).string("buy");
             }
-            w.u64(0).u64(0).u64(0).u64(0); // cashback bps/amt, buyback bps/amt
+            w.u64(s.cashback_fee_bps.unwrap_or(0)).u64(s.cashback.unwrap_or(0)).u64(s.buyback_fee_bps.unwrap_or(0)).u64(s.buyback_fee.unwrap_or(0));
             w.i128(s.virtual_quote_reserves.unwrap_or(0)).bool(false).u64(0).u64(0).u64(0).u64(0);
         }
         PumpSwapEvent::Liquidity(l) => {

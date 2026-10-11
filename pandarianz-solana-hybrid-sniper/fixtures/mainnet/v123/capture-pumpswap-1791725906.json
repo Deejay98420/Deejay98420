@@ -1,0 +1,150 @@
+{
+  "buys": 10,
+  "request_budget": 60,
+  "requests_sent": 20,
+  "saved": [
+    {
+      "sha256": "fdb2137bedca865a122778bc6b5fd800b5cda0eeb805a42a50d3cae972bfa111",
+      "side": "Sell",
+      "signature": "2BcdZqag5AsSyJrTukNobZA9woLFERp7KeAGQwuaB9VDrRudSDYV5wPoAPJdTAkveCw9yAqUr9GNjfQLYKqzcFgt",
+      "slot": 455670465,
+      "version": "1"
+    },
+    {
+      "sha256": "9a91299368a06309ea9c9bfa5f9a5a4e9525b782d4e8179d592722e27bc3f976",
+      "side": "Buy",
+      "signature": "5GCsNP5UbaWefdaT1SkqAzWxcZD3D5TvME2vCNhKneeKnNSWpMdBnQXJTiVm9DwGQcmAXkXdu9Q2qDs8Jmx9PDeb",
+      "slot": 455670465,
+      "version": "1"
+    },
+    {
+      "sha256": "e1879d4dab8bea438edf2adb8316e7dfa534ae795e8050ee6a5061db27a03dd6",
+      "side": "Buy",
+      "signature": "4VeQPGDw3fZQtTemQoNS5zJcjQRvRVwWQXUMCcB1UcfsoA59DHFequVKTsidiqVzoH3UHKgVw2LB8aXpaanKgmtu",
+      "slot": 455670468,
+      "version": "0"
+    },
+    {
+      "sha256": "1d00cfbac83ddca9d94237deb927f688c795ef46311390016228b2d9d864f748",
+      "side": "Sell",
+      "signature": "455hevwaUtjs6GDY568xvAL2TrrYNygodwRHbbDn9wEJJghtPyZMABHfwEHd5jR3FGsef8s7D2ZD6Uwi4uJbiFeA",
+      "slot": 455670472,
+      "version": "0"
+    },
+    {
+      "sha256": "cec9d9be611a2f5b7428bb0406c8bf0dfdaef345eeffa62e7607a63650d2955c",
+      "side": "Buy",
+      "signature": "3BNQKP7Vm52hp1MmbiodNq4LVKyqnct6zCFwsjmsNvivD3qJSNfmU7FAkPgrcHvZhxicrtmxEB9VjAPn1UCafe1z",
+      "slot": 455670478,
+      "version": "0"
+    },
+    {
+      "sha256": "a7cf0fa7a6954c12ec35988e840d749b1dd0c38f0cf4b0d5a6f124fd35cc347e",
+      "side": "Sell",
+      "signature": "Wo4pHWDzjBZpUqt6x8pyRQdSWgbmawgrG3j4MhA1E57f4n5qmJU8gX3wRUTuuPWinZm5U6QcBUp5HU5EWU8BXYi",
+      "slot": 455670481,
+      "version": "1"
+    },
+    {
+      "sha256": "ae6cc630b580d24ee8e08c456adb61b00dba3bd4cd5af75083cdf43dcfdc2806",
+      "side": "Buy",
+      "signature": "4biAZZLYZ9N94kuNAYtDWLG1r5CUgJfqXokh35dS5h4NXggRkhUaRM4joCK6x3qh5m1M61amx2zCAJAbTPc3grM6",
+      "slot": 455670487,
+      "version": "legacy"
+    },
+    {
+      "sha256": "2aeb9268e55cdd98c8b3e60cffe4529eceb77ad1d970a44f2b746c8345ec708e",
+      "side": "Buy",
+      "signature": "3zV4Shbf2RoMCC6mWRADxfn55AegjADicpt8aeaTFb36WjYeRW1R1zmbhK4X4SNV6zQKEK5GKPUr74yhKdjc9KDL",
+      "slot": 455670493,
+      "version": "0"
+    },
+    {
+      "sha256": "76d7e24c22ba39c9f909ae4e97223b3d7c589d8679962f442eb70d55bff8d77b",
+      "side": "Sell",
+      "signature": "AeLpMcbyaXVm5ZBNzK8RnedVZEWEh6DiL1iR1jTUVLKHH2J91cj61gowBvjgb3hwBnNEJ3QtNfvS4cMtmNLgjvq",
+      "slot": 455670496,
+      "version": "0"
+    },
+    {
+      "sha256": "779cf1dc2f436428da469f8339815a35fd755673d1c596b4ad7836ff95ddbb79",
+      "side": "Sell",
+      "signature": "4JmdVUUU2RUVY8da7N5Z41KvRqFXZfe3g6qthCkiMjJMPsx9r7gmB6FMa1AkEoWDT2ig29Cu97mDCmNhMYvmuiLu",
+      "slot": 455670501,
+      "version": "0"
+    },
+    {
+      "sha256": "fe49618ba179b4290a94c2569b562a6bda9e9a2dee68eb0e25318722c75c0248",
+      "side": "Buy",
+      "signature": "57M2ZAsYhGUgGAmQJwFBPFBeg6nY2i1bQKLqugKtQK6ZN8SwpHUjt1wNmzWyLd8fGrSa6EkB4pSRDa873SkLSrbr",
+      "slot": 455670505,
+      "version": "0"
+    },
+    {
+      "sha256": "f9945263c60424e7bea18be4877c77d5b38a9eec99cbcbba156df3e62f32a8da",
+      "side": "Sell",
+      "signature": "3t4gQBTQ7yyyaEYFvB1mRhsJ8Qxdj548kchjYutkGZGaTDr5ptjS2UD4ahN1j7ywyuBR9gHgNvPhLnJRDMWkCpuR",
+      "slot": 455670508,
+      "version": "legacy"
+    },
+    {
+      "sha256": "cd74850f826c101be1bc028afaddda3404089c33951cf0447b81263e5509ce40",
+      "side": "Buy",
+      "signature": "5QP9C5kQLmpnr4yv662cHUUvHSNsVZ24EZC3K3FoDS5EPKgBtBSP3sGHwHUAzXnqzLjLG2tY8TR368DpzwctCEGE",
+      "slot": 455670513,
+      "version": "legacy"
+    },
+    {
+      "sha256": "267542790265eebd5d7f9c27d1da62f6ea6e4e347dfe9745c9469c55ac1a4728",
+      "side": "Sell",
+      "signature": "2JUcyCfTNRoMpwLLMmY6T6ydnM6NK655eAbTbcHV8iG5Y6fSA2G6S6eCYCrB8AowULBDuFCTAbFSJWNjVeYKZH1C",
+      "slot": 455670519,
+      "version": "0"
+    },
+    {
+      "sha256": "62119341b31edec89f8a32d4a034dc798a3c4d6d21c7bba587e11db8f1e16ac4",
+      "side": "Buy",
+      "signature": "4hC1P9zKiT5YJRZvhosvL21Bi7tCJEsi7EFVUTXJuw7sBji8upH1pbmKufrct9nzLLgyycGbWR2yEDSpLxEjxVLj",
+      "slot": 455670526,
+      "version": "legacy"
+    },
+    {
+      "sha256": "76b30cb1665d6ca8427548329b5b86f11335da379dbb0bc45c27c48be029cab5",
+      "side": "Sell",
+      "signature": "7kaeJtWtg2ZfLCDsfJKPWxCzikp6CRBTQCg17qxGT4D6vn25urpjb4GrikjEzFnkEag1Jt9Q8Mq4dzX89zhsRKf",
+      "slot": 455670529,
+      "version": "0"
+    },
+    {
+      "sha256": "434b45845d18e41d0e207e85e76d2713c7a3db2ade4f9a661c44e8503462f647",
+      "side": "Buy",
+      "signature": "37F13Y3YoQmU3NxSJXKcFxFP87bNmS4XQHmLA5Wwz4g4ozXdox7uDjVHnZErpZyANdr8VeynfgkSE5YAJjxokTQu",
+      "slot": 455670533,
+      "version": "1"
+    },
+    {
+      "sha256": "27f6977fec8cb6b09d97f0b9396830cb958a37c9bf537151bb7a38a0779784cd",
+      "side": "Sell",
+      "signature": "5UirE2yXMWCH5S5yjwdjE7zasTe4RmLi7q6g9wV4bytTYzrfMaxf9uND5gGFo5Dg5mqVS8EuTcBD78wpjgvYBiXR",
+      "slot": 455670538,
+      "version": "1"
+    },
+    {
+      "sha256": "b77cf3bea53db177037de9e88dd1654c7d045fac209f7bebe71ea9aea520d031",
+      "side": "Buy",
+      "signature": "57ChT6wL38DBY6zXmosiKK5K4amMztnhgepF6DM3CMHme5SRGQfkeN7NXmBREBEW5hhKrc17vzPcukhbGL5VWfta",
+      "slot": 455670541,
+      "version": "legacy"
+    },
+    {
+      "sha256": "9a3f973d2bc2948e164b2fa033a71bdb2f69b31810532d8a5bd8c4de78173199",
+      "side": "Sell",
+      "signature": "3zGx4mqHMDLfyP3fhmqnWXMi9g3y41nybHagJukfShnzP4oupSac1xkkeSeZSBJXS8F87cRg7xuwpyp8g8pnz9xU",
+      "slot": 455670546,
+      "version": "1"
+    }
+  ],
+  "sells": 10,
+  "stop_reason": "target reached",
+  "venue": "pumpswap"
+}

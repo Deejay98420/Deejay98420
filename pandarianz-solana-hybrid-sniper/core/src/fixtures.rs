@@ -302,6 +302,15 @@ impl Pool {
             coin_creator_fee_bps: Some(self.creator_bps),
             coin_creator_fee: Some(creator),
             virtual_quote_reserves: Some(0),
+            // full current layout (zero keys / amounts are what the encoder writes)
+            protocol_fee_recipient: Some(Pubkey::default()),
+            protocol_fee_recipient_token_account: Some(Pubkey::default()),
+            user_base_token_account: Some(Pubkey::default()),
+            user_quote_token_account: Some(Pubkey::default()),
+            cashback_fee_bps: Some(0),
+            cashback: Some(0),
+            buyback_fee_bps: Some(0),
+            buyback_fee: Some(0),
         })
     }
     /// Exact-quote-in buy following the pump-swap SDK (`buyQuoteInput`).

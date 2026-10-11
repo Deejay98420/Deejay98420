@@ -872,6 +872,7 @@ async fn capture(signatures: Vec<String>, from_live: Option<usize>, lim: Capture
 async fn capture_pumpswap(target: usize, lim: CaptureLimits, out: PathBuf, report_dir: PathBuf) -> anyhow::Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use sniper_core::capture::{pumpswap_side_from_logs, Offer, Selector, Side};
+    use std::collections::HashMap;
     use sniper_core::rpc::{RpcClient, RpcError, SchedulerConfig};
     use tokio_tungstenite::tungstenite::Message;
     let rpc_urls = sniper_core::live::rpc_urls_from_env();
@@ -900,15 +901,19 @@ async fn capture_pumpswap(target: usize, lim: CaptureLimits, out: PathBuf, repor
         "PUMPSWAP CAPTURE (logsSubscribe + read-only getTransaction, maxSupportedTransactionVersion={}): target {target} new swaps (buys and sells), ≤{} requests, ≤{}s, {} req/s; {} files already in {}",
         rpc.max_tx_version, lim.max_requests, lim.max_seconds, lim.rate, existing.len(), out.display()
     );
-    // WebSocket reader → bounded channel (try_send: never blocks, drops counted)
-    let (tx, mut rx) = mpsc::channel::<(String, Vec<String>, bool)>(512);
-    let dropped_ws = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // WebSocket reader: classifies every notification on arrival (PumpSwap's own Buy/Sell log),
+    // deduplicates, and hands only relevant candidates to the bounded channel (try_send: never
+    // blocks; relevant losses are counted separately from irrelevant traffic)
+    let (tx, mut rx) = mpsc::channel::<(String, Side, i64)>(512);
+    let intake = Arc::new(std::sync::Mutex::new(sniper_core::capture::IntakeStats::default()));
     let ws_url = ws_urls[0].clone();
-    let dw = dropped_ws.clone();
+    let st_in = intake.clone();
     let reader = tokio::spawn(async move {
         let (mut ws, _) = tokio_tungstenite::connect_async(ws_url.as_str()).await.map_err(|e| format!("connect: {e}"))?;
         let req = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"logsSubscribe","params":[{"mentions":[programs::PUMP_SWAP]},{"commitment":"confirmed"}]});
         ws.send(Message::Text(req.to_string())).await.map_err(|e| format!("send: {e}"))?;
+        let mut recent: std::collections::HashSet<String> = Default::default();
+        let mut order: std::collections::VecDeque<String> = Default::default();
         loop {
             let msg = match tokio::time::timeout(Duration::from_secs(30), ws.next()).await {
                 Err(_) => return Err("no WebSocket message for 30 s".to_string()),
@@ -918,12 +923,37 @@ async fn capture_pumpswap(target: usize, lim: CaptureLimits, out: PathBuf, repor
             };
             match msg {
                 Message::Text(t) => {
+                    let recv = wall_us();
                     if let Some((_, false, detail)) = sniper_core::stream::ws::parse_ack(&t) {
                         return Err(format!("logsSubscribe rejected: {detail}"));
                     }
-                    if let Some(sniper_core::stream::ws::Parsed::Event(ev)) = sniper_core::stream::ws::parse_message(&t, "capture", sniper_core::types::Commitment::Confirmed, wall_us()) {
-                        if tx.try_send((ev.signature, ev.logs, ev.err.is_some())).is_err() {
-                            dw.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(sniper_core::stream::ws::Parsed::Event(ev)) = sniper_core::stream::ws::parse_message(&t, "capture", sniper_core::types::Commitment::Confirmed, recv) {
+                        let mut st = st_in.lock().unwrap();
+                        st.notifications += 1;
+                        if ev.err.is_some() {
+                            st.failed_tx += 1;
+                            continue;
+                        }
+                        let Some(side) = pumpswap_side_from_logs(&ev.logs, false) else {
+                            st.irrelevant += 1;
+                            continue;
+                        };
+                        if !recent.insert(ev.signature.clone()) {
+                            st.duplicate_notifications += 1;
+                            continue;
+                        }
+                        order.push_back(ev.signature.clone());
+                        if order.len() > 50_000 {
+                            if let Some(o) = order.pop_front() {
+                                recent.remove(&o);
+                            }
+                        }
+                        match side {
+                            Side::Buy => st.relevant_buys += 1,
+                            Side::Sell => st.relevant_sells += 1,
+                        }
+                        if tx.try_send((ev.signature, side, recv)).is_err() {
+                            st.relevant_dropped_backpressure += 1;
                         }
                     }
                 }
@@ -938,7 +968,9 @@ async fn capture_pumpswap(target: usize, lim: CaptureLimits, out: PathBuf, repor
         Ok::<(), String>(())
     });
     let mut sel = Selector::new(lim.concurrency.max(1) * 25, existing.iter().cloned());
-    let (mut notifications, mut not_swap, mut saved_buys, mut saved_sells, mut no_swap_decoded, mut not_found, mut invalid, mut side_mismatch) = (0u64, 0u64, 0usize, 0usize, 0u64, 0u64, 0u64, 0u64);
+    let mut intake_at: HashMap<String, i64> = HashMap::new();
+    let (mut lat_queue_ms, mut lat_rpc_ms, mut lat_chain_ms): (Vec<i64>, Vec<i64>, Vec<i64>) = (vec![], vec![], vec![]);
+    let (mut saved_buys, mut saved_sells, mut no_swap_decoded, mut not_found, mut invalid, mut side_mismatch) = (0usize, 0usize, 0u64, 0u64, 0u64, 0u64);
     let mut errors: std::collections::BTreeMap<String, u64> = Default::default();
     let mut examples: Vec<String> = Vec::new();
     let mut manifest: Vec<serde_json::Value> = Vec::new();
@@ -952,13 +984,12 @@ async fn capture_pumpswap(target: usize, lim: CaptureLimits, out: PathBuf, repor
         if rpc.budget_remaining() == Some(0) {
             break format!("request budget ({}) spent", lim.max_requests);
         }
-        while let Ok((sig, logs, failed)) = rx.try_recv() {
-            notifications += 1;
-            match pumpswap_side_from_logs(&logs, failed) {
-                Some(side) => {
-                    let _: Offer = sel.offer(&sig, side);
-                }
-                None => not_swap += 1,
+        while let Ok((sig, side, recv)) = rx.try_recv() {
+            if sel.offer(&sig, side) == Offer::Queued {
+                intake_at.insert(sig, recv);
+            }
+            for e in sel.take_evicted() {
+                intake_at.remove(&e);
             }
         }
         let Some((sig, cand)) = sel.next(saved_buys, saved_sells) else {
@@ -966,18 +997,21 @@ async fn capture_pumpswap(target: usize, lim: CaptureLimits, out: PathBuf, repor
                 break "WebSocket stream ended with no queued candidates".into();
             }
             let wait = deadline.saturating_duration_since(std::time::Instant::now()).min(Duration::from_secs(1));
-            if let Ok(Some((sig, logs, failed))) = tokio::time::timeout(wait, rx.recv()).await {
-                notifications += 1;
-                match pumpswap_side_from_logs(&logs, failed) {
-                    Some(side) => {
-                        sel.offer(&sig, side);
-                    }
-                    None => not_swap += 1,
+            if let Ok(Some((sig, side, recv))) = tokio::time::timeout(wait, rx.recv()).await {
+                if sel.offer(&sig, side) == Offer::Queued {
+                    intake_at.insert(sig, recv);
+                }
+                for e in sel.take_evicted() {
+                    intake_at.remove(&e);
                 }
             }
             continue;
         };
-        match rpc.get_transaction_raw(&sig).await {
+        let recv_us = intake_at.remove(&sig);
+        let fetch_start = wall_us();
+        let res = rpc.get_transaction_raw(&sig).await;
+        let fetch_end = wall_us();
+        match res {
             Ok(raw) if raw.is_null() => not_found += 1,
             Ok(raw) => {
                 let problems = sniper_core::txmodel::structure_problems(&raw);
@@ -1001,6 +1035,7 @@ async fn capture_pumpswap(target: usize, lim: CaptureLimits, out: PathBuf, repor
                         "request": {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": rpc.max_tx_version},
                         "transaction_version": v.version, "slot": v.slot, "block_time": v.block_time, "classification": v.classification,
                         "sampled_from": "pumpswap logsSubscribe", "candidate_side": format!("{cand:?}"),
+                        "timing_us": {"notification_received": recv_us, "fetch_started": fetch_start, "fetch_finished": fetch_end},
                         "note": "REAL mainnet transaction captured read-only; full RPC result preserved verbatim"},
                     "signature": sig,
                     "rpc_result": raw,
@@ -1016,7 +1051,15 @@ async fn capture_pumpswap(target: usize, lim: CaptureLimits, out: PathBuf, repor
                     Err(e) => return Err(e.into()),
                 }
                 use sha2::Digest;
-                manifest.push(serde_json::json!({"signature": sig, "side": format!("{side:?}"), "version": v.version, "slot": v.slot, "sha256": format!("{:x}", sha2::Sha256::digest(bytes.as_bytes()))}));
+                if let Some(r) = recv_us {
+                    lat_queue_ms.push((fetch_start - r) / 1000);
+                    if let Some(bt) = v.block_time {
+                        lat_chain_ms.push(r / 1000 - bt * 1000);
+                    }
+                }
+                lat_rpc_ms.push((fetch_end - fetch_start) / 1000);
+                manifest.push(serde_json::json!({"signature": sig, "side": format!("{side:?}"), "version": v.version, "slot": v.slot, "sha256": format!("{:x}", sha2::Sha256::digest(bytes.as_bytes())),
+                    "notification_received_us": recv_us, "fetch_started_us": fetch_start, "fetch_finished_us": fetch_end, "block_time": v.block_time}));
                 match side {
                     Side::Buy => saved_buys += 1,
                     Side::Sell => saved_sells += 1,
@@ -1041,11 +1084,20 @@ async fn capture_pumpswap(target: usize, lim: CaptureLimits, out: PathBuf, repor
     let st = rpc.scheduler_stats();
     let (qb, qs) = sel.queued();
     println!("PUMPSWAP CAPTURE RESULT: saved {} new swaps ({saved_buys} buys, {saved_sells} sells) of target {target} in {:.0}s — stop reason: {stop_reason}", saved_buys + saved_sells, t0.elapsed().as_secs_f64());
+    let ist = intake.lock().unwrap().clone();
+    let relevant = ist.relevant_buys + ist.relevant_sells;
     println!(
-        "  notifications {notifications}: {not_swap} not a PumpSwap Buy/Sell, {} duplicate/already captured, {} dropped (queue bound), {} dropped at the WebSocket channel; {qb}/{qs} buy/sell candidates left unfetched",
-        sel.duplicates,
-        sel.dropped,
-        dropped_ws.load(std::sync::atomic::Ordering::Relaxed)
+        "  intake: {} notifications — {} irrelevant (not a PumpSwap Buy/Sell), {} failed txs, {} duplicate notifications; {relevant} relevant swaps ({} buys, {} sells)",
+        ist.notifications, ist.irrelevant, ist.failed_tx, ist.duplicate_notifications, ist.relevant_buys, ist.relevant_sells
+    );
+    println!(
+        "  relevant swaps not fetched: {} dropped by backpressure (channel full while fetching), {} superseded by fresher candidates (bounded queue), {} already captured, {qb}/{qs} buy/sell left queued — expected: fetching is capped at {} req/s",
+        ist.relevant_dropped_backpressure, sel.dropped, sel.duplicates, lim.rate
+    );
+    let fmt = |v: &mut Vec<i64>| sniper_core::capture::percentiles(v).map(|(a, b, c)| format!("p50 {a} / p95 {b} / max {c} ms")).unwrap_or("n/a".into());
+    println!(
+        "  latency (measured): notification → fetch start {}; getTransaction {}; block time → notification {} (block time has 1 s resolution)",
+        fmt(&mut lat_queue_ms), fmt(&mut lat_rpc_ms), fmt(&mut lat_chain_ms)
     );
     println!("  fetched but not saved: {no_swap_decoded} without a decoded PumpSwap swap, {not_found} not found, {invalid} invalid; log-side vs decoded-side mismatches {side_mismatch}");
     println!(
@@ -1063,7 +1115,9 @@ async fn capture_pumpswap(target: usize, lim: CaptureLimits, out: PathBuf, repor
     }
     std::fs::create_dir_all(&report_dir)?;
     let mp = report_dir.join(format!("capture-pumpswap-{}.json", wall_us() / 1_000_000));
-    std::fs::write(&mp, serde_json::to_string_pretty(&serde_json::json!({"venue": "pumpswap", "stop_reason": stop_reason, "saved": manifest, "buys": saved_buys, "sells": saved_sells, "requests_sent": st.http_sent, "request_budget": lim.max_requests}))?)?;
+    std::fs::write(&mp, serde_json::to_string_pretty(&serde_json::json!({"venue": "pumpswap", "stop_reason": stop_reason, "saved": manifest, "buys": saved_buys, "sells": saved_sells, "requests_sent": st.http_sent, "request_budget": lim.max_requests,
+        "intake": ist, "superseded_by_fresher": sel.dropped,
+        "latency_ms": {"notification_to_fetch_start": sniper_core::capture::percentiles(&mut lat_queue_ms), "get_transaction": sniper_core::capture::percentiles(&mut lat_rpc_ms), "block_time_to_notification": sniper_core::capture::percentiles(&mut lat_chain_ms)}}))?)?;
     println!("  PumpSwap evidence manifest: {}", mp.display());
     verify_fixtures(&out, &report_dir, EngineConfig::load(std::env::var("SNIPER_CONFIG").ok().map(PathBuf::from).as_deref())?.evidence.min_events_for_mainnet_verified).map(|_| ())
 }
@@ -1193,7 +1247,15 @@ fn compare_reports(prev: &serde_json::Value, prev_detail: &serde_json::Value, no
             let (name, ev) = (c["name"].as_str().unwrap_or(""), c["event_index"].as_u64().unwrap_or(0) as usize);
             // renamed checks: token-quoted curves report trade.quote_amount instead of trade.sol_amount
             let after = now_tx.and_then(|t| {
-                t.checks.iter().find(|x| x.name == name && x.event_index == ev).or_else(|| t.checks.iter().find(|x| name == "trade.sol_amount" && x.name == "trade.quote_amount" && x.event_index == ev))
+                t.checks.iter().find(|x| x.name == name && x.event_index == ev).or_else(|| {
+                    // renamed checks: token-quoted curves (trade.quote_amount); PumpSwap v2 fee routing
+                    let alias = match name {
+                        "trade.sol_amount" => "trade.quote_amount",
+                        "swap.fee_transfers" => "swap.protocol_fee_observed",
+                        _ => "",
+                    };
+                    t.checks.iter().find(|x| x.name == alias && x.event_index == ev)
+                })
             });
             let (a_out, a_detail, a_ix) = match after {
                 Some(x) => (format!("{:?}", x.outcome).to_lowercase(), x.detail.clone(), x.instruction.clone().unwrap_or_default()),

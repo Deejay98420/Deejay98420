@@ -506,9 +506,7 @@ pub fn verify_tx(rpc_result: &Value, signature: &str) -> TxVerification {
     let mut o = Out { checks: &mut checks };
     // aggregated per-account expectations
     let (mut curve_vault, mut user_ata) = (BTreeMap::new(), BTreeMap::new());
-    let (mut pool_base, mut pool_quote, mut swap_user_base, mut amm_proto, mut amm_creator) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
     let mut mints: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    let mut amm_v2_events: HashSet<usize> = HashSet::new();
 
     for (i, d) in events.iter().enumerate() {
         v.event_instruction.push(mapping[i].as_ref().map(|(_, def)| def.name.clone()).unwrap_or_default());
@@ -698,17 +696,8 @@ pub fn verify_tx(rpc_result: &Value, signature: &str) -> TxVerification {
                 if let Some(bm) = acct("base_mint") {
                     mints.entry(bm).or_default().push(i);
                 }
-                let base = s.base_amount as i128;
-                add_expect(&mut pool_base, acct("pool_base_token_account").as_deref(), if s.is_buy { -base } else { base }, i);
-                add_expect(&mut swap_user_base, acct("user_base_token_account").as_deref(), if s.is_buy { base } else { -base }, i);
-                let q = s.quote_amount_pool as i128;
-                add_expect(&mut pool_quote, acct("pool_quote_token_account").as_deref(), if s.is_buy { q } else { -q }, i);
-                if ix_name.ends_with("_v2") {
-                    amm_v2_events.insert(i);
-                    o.add(i, "swap.fee_transfers", Outcome::Inconclusive, true, format!("{ix_name}: v2 fee routing (buyback / fee config) has no per-fee recipient accounts in the instruction"));
-                } else {
-                    add_expect(&mut amm_proto, acct("protocol_fee_recipient_token_account").as_deref(), s.protocol_fee as i128, i);
-                    add_expect(&mut amm_creator, acct("coin_creator_vault_ata").as_deref(), s.coin_creator_fee.unwrap_or(0) as i128, i);
+                if let Ok((ix, def)) = mp {
+                    amm_swap_checks(&m, &mut o, i, *ix, def, s, &mut v.fee_hypotheses);
                 }
             }
             VenueEvent::PumpSwap(PumpSwapEvent::Liquidity(l)) => {
@@ -729,37 +718,47 @@ pub fn verify_tx(rpc_result: &Value, signature: &str) -> TxVerification {
     // ---- aggregated account checks (several trades may share an account) ----
     o.group("trade.curve_vault_delta", &curve_vault, |a| ctx.token_net(a), "bonding-curve token vault");
     o.group("trade.user_token_delta", &user_ata, |a| ctx.token_net(a), "user token account");
-    o.group("swap.pool_base_delta", &pool_base, |a| ctx.token_net(a), "pool base vault");
-    o.group("swap.user_base_delta", &swap_user_base, |a| ctx.token_net(a), "user base token account");
-    // pool quote vault: v1 moves every fee out of the vault; v2 may retain protocol/creator fees
-    for (acct, e) in &pool_quote {
-        let obs = ctx.token_net(acct);
-        for &i in &e.events {
-            let retained: i128 = e
-                .events
-                .iter()
-                .filter(|k| amm_v2_events.contains(k))
-                .filter_map(|k| match &events[*k].event {
-                    VenueEvent::PumpSwap(PumpSwapEvent::Swap(s)) => Some((s.protocol_fee + s.coin_creator_fee.unwrap_or(0)) as i128),
-                    _ => None,
-                })
-                .sum();
-            match &obs {
-                Ok(x) if *x == e.expected => o.add(i, "swap.pool_quote_delta", Outcome::Pass, true, format!("pool quote vault {}: observed {x} = decoded {}", short(acct), e.expected)),
-                Ok(x) if retained != 0 && *x == e.expected + retained => {
-                    o.add(i, "swap.pool_quote_delta", Outcome::Pass, true, format!("pool quote vault {}: observed {x} = decoded {} + {retained} protocol/creator fees retained (v2)", short(acct), e.expected));
-                    v.fee_hypotheses.push("amm_v2_fees_retained_in_vault".into());
-                }
-                Ok(x) => o.add(i, "swap.pool_quote_delta", Outcome::Fail, true, format!("pool quote vault {}: observed {x} vs decoded {} (diff {})", short(acct), e.expected, x - e.expected)),
-                Err(er) => o.add(i, "swap.pool_quote_delta", Outcome::Inconclusive, true, er.clone()),
-            }
-        }
-    }
-    o.group("swap.protocol_fee_observed", &amm_proto, |a| ctx.token_net(a), "protocol fee token account");
-    o.group("swap.creator_fee_observed", &amm_creator, |a| ctx.token_net(a), "coin creator vault token account");
     // ---- supply conservation per mint: Σ balance changes = minted − burned ----
+    // Wrapped SOL is not minted or burned: a native token account holds lamports = rent reserve +
+    // amount, so wrapping/unwrapping is checked per account as token Δ = lamport Δ − rent Δ.
     for (mint, evs) in &mints {
         let accts: Vec<&String> = m.tokens.iter().filter(|(_, t)| &t.mint == mint).map(|(a, _)| a).collect();
+        if mint == crate::types::WSOL_MINT {
+            let mut bad = Vec::new();
+            let mut unsynced = Vec::new();
+            for a in &accts {
+                let t = &m.tokens[*a];
+                let rent = match (t.pre, t.post) {
+                    (None, Some(_)) => TOKEN_ACCOUNT_RENT,
+                    (Some(_), None) => -TOKEN_ACCOUNT_RENT,
+                    _ => 0,
+                };
+                match m.lamport_delta(a) {
+                    Some(l) if l - rent == t.delta() => {}
+                    Some(l) => {
+                        // lamports sent without a syncNative are legal (not yet wrapped): evidence gap, not a contradiction
+                        let synced_later = m.ixs.iter().any(|x| x.parsed_type.as_deref() == Some("syncNative") && x.info["account"].as_str() == Some(a.as_str()));
+                        let credited = m.flows.iter().any(|f| matches!(f, crate::txmodel::Flow::Lamports { to, .. } if to == *a));
+                        if credited && !synced_later {
+                            unsynced.push(format!("{} (token Δ {}, lamport Δ {l})", short(a), t.delta()));
+                        } else {
+                            bad.push(format!("{}: token Δ {} vs lamport Δ {l} − rent Δ {rent}", short(a), t.delta()));
+                        }
+                    }
+                    None => unsynced.push(format!("{} (no lamport evidence)", short(a))),
+                }
+            }
+            for &i in evs {
+                if !bad.is_empty() {
+                    o.add(i, "token.mint_conservation", Outcome::Fail, true, format!("wrapped SOL accounts inconsistent with their lamports: {}", bad.join("; ")));
+                } else if !unsynced.is_empty() {
+                    o.add(i, "token.mint_conservation", Outcome::Inconclusive, true, format!("wrapped SOL: unsynced lamports / missing evidence for {}", unsynced.join(", ")));
+                } else {
+                    o.add(i, "token.mint_conservation", Outcome::Pass, true, format!("wrapped SOL: all {} native token accounts satisfy token Δ = lamport Δ − rent Δ (wrap/unwrap, not mint/burn)", accts.len()));
+                }
+            }
+            continue;
+        }
         let net: i128 = accts.iter().map(|a| m.tokens[*a].delta()).sum();
         let minted = m.net_minted(mint);
         let unexplained = accts.iter().any(|a| m.unexplained_token_accounts.contains(a));
@@ -788,6 +787,199 @@ pub fn verify_tx(rpc_result: &Value, signature: &str) -> TxVerification {
     v
 }
 
+
+// ------------------------------------------------------------------------------------------------
+// PumpSwap swaps: every amount from parsed transfers inside the swap instruction
+
+/// Rent-exempt reserve of a 165-byte SPL token account (lamports): wrapped-SOL accounts hold
+/// lamports = reserve + amount.
+pub const TOKEN_ACCOUNT_RENT: i128 = 2_039_280;
+
+fn flow_between(m: &TxModel, from: &str, to: &str, range: &std::ops::Range<usize>) -> i128 {
+    m.flows
+        .iter()
+        .filter_map(|f| match f {
+            crate::txmodel::Flow::Token { ix, from: Some(a), to: Some(b), amount, .. } if a == from && b == to && range.contains(ix) => Some(*amount),
+            _ => None,
+        })
+        .sum()
+}
+
+/// PumpSwap fee routing per the official SDK (`offlinePumpAmm.ts`):
+/// * v1 `buy`/`sell`/`buy_exact_quote_in`: fees leave around the pool — protocol fee to
+///   `protocol_fee_recipient_token_account` plus the buyback slice to the buyback token account
+///   passed as a remaining account right after its (official) buyback wallet; creator fee to
+///   `coin_creator_vault_ata`. The quote vault moves by exactly `quote_amount_pool`.
+/// * v2: "protocol and coin-creator fees stay in the pool's quote vault … only the buyback slice
+///   of the protocol fee is paid in the trade … to a listed buyback fee recipient's quote ATA".
+fn amm_swap_checks(m: &TxModel, o: &mut Out, i: usize, ix: usize, def: &IxDef, s: &crate::decode::pumpswap::Swap, routes: &mut Vec<String>) {
+    let accts = &m.ixs[ix].accounts;
+    let name = &def.name;
+    let here = format!("{} {name}", m.ix_ref(ix));
+    let names = ["swap.base_transfer", "swap.pool_base_delta", "swap.user_base_delta", "swap.pool_quote_delta", "swap.protocol_fee_observed", "swap.creator_fee_observed"];
+    // no inner-instruction record → the transfers inside the swap are unknown: evidence gap, never 0
+    let sub = if m.inner_recorded { m.subtree(ix) } else { None };
+    let Some(sub) = sub else {
+        let why = if m.inner_recorded { "call depth unavailable" } else { "transaction has no inner-instruction record" };
+        for n in names {
+            o.add(i, n, Outcome::Inconclusive, true, format!("{here}: {why}"));
+        }
+        return;
+    };
+    let get = |n: &str| def.get(accts, n).map(String::from);
+    let v2 = name.ends_with("_v2");
+    let base = s.base_amount as i128;
+    // event-named accounts must be the instruction's accounts
+    let mut mismatch = Vec::new();
+    for (ev, role) in [(&s.user_base_token_account, "user_base_token_account"), (&s.user_quote_token_account, "user_quote_token_account"), (&s.protocol_fee_recipient_token_account, "protocol_fee_recipient_token_account")] {
+        if let (Some(e), Some(a)) = (ev.filter(|k| *k != Pubkey::default()), get(role)) {
+            if e.to_string() != a {
+                mismatch.push(format!("event {role} {} ≠ instruction {}", short(&e.to_string()), short(&a)));
+            }
+        }
+    }
+    if !mismatch.is_empty() {
+        o.add(i, "swap.event_accounts", Outcome::Fail, true, mismatch.join("; "));
+    }
+    // base leg
+    match (get("user_base_token_account"), get("pool_base_token_account")) {
+        (Some(ub), Some(pb)) => {
+            let moved = if s.is_buy { flow_between(m, &pb, &ub, &sub) } else { flow_between(m, &ub, &pb, &sub) };
+            o.cmp(i, "swap.base_transfer", Ok(moved), base, &format!("base tokens {} inside {here}", if s.is_buy { "pool → user" } else { "user → pool" }));
+            o.cmp(i, "swap.pool_base_delta", Ok(token_net_in(m, &pb, &sub)), if s.is_buy { -base } else { base }, &format!("pool base vault {} net inside {here}", short(&pb)));
+            o.cmp(i, "swap.user_base_delta", Ok(token_net_in(m, &ub, &sub)), if s.is_buy { base } else { -base }, &format!("user base account {} net inside {here}", short(&ub)));
+        }
+        _ => {
+            for n in ["swap.base_transfer", "swap.pool_base_delta", "swap.user_base_delta"] {
+                o.add(i, n, Outcome::Inconclusive, true, format!("{here}: base accounts not in instruction"));
+            }
+        }
+    }
+    let (protocol, creator) = (s.protocol_fee as i128, s.coin_creator_fee.unwrap_or(0) as i128);
+    let cashback = s.cashback.unwrap_or(0) as i128;
+    let bb = s.buyback_fee.map(|x| x as i128);
+    let q = s.quote_amount_pool as i128;
+    // quote vault movement inside the instruction
+    let vault_ok: Option<bool> = match get("pool_quote_token_account") {
+        None => {
+            o.add(i, "swap.pool_quote_delta", Outcome::Inconclusive, true, format!("{here}: pool quote vault not in instruction"));
+            None
+        }
+        Some(pq) => {
+            let net = token_net_in(m, &pq, &sub);
+            let signed = if s.is_buy { q } else { -q };
+            let (expected, formula) = if !v2 {
+                (Some(signed), format!("{}quote_amount_pool {q}", if s.is_buy { "+" } else { "−" }))
+            } else {
+                match bb {
+                    Some(b) => (Some(signed + protocol + creator - b), format!("{}quote_amount_pool {q} + protocol fee {protocol} + creator fee {creator} − buyback slice {b} (v2: fees stay in the vault)", if s.is_buy { "+" } else { "−" })),
+                    None => (None, String::new()),
+                }
+            };
+            match expected {
+                None => {
+                    o.add(i, "swap.pool_quote_delta", Outcome::Inconclusive, true, format!("{here}: older event layout without buyback_fee"));
+                    None
+                }
+                Some(e) if e == net => {
+                    o.add(i, "swap.pool_quote_delta", Outcome::Pass, true, format!("pool quote vault {} net {net} = {formula} inside {here}", short(&pq)));
+                    Some(true)
+                }
+                Some(e) if cashback != 0 => {
+                    o.add(i, "swap.pool_quote_delta", Outcome::Inconclusive, true, format!("pool quote vault {} net {net} vs {formula} = {e}; cashback {cashback} — routing undocumented", short(&pq)));
+                    None
+                }
+                Some(e) => {
+                    o.add(i, "swap.pool_quote_delta", Outcome::Fail, true, format!("pool quote vault {} net {net} vs {formula} = {e} (diff {}) inside {here}", short(&pq), net - e));
+                    Some(false)
+                }
+            }
+        }
+    };
+    if v2 {
+        // buyback slice to the instruction's buyback_fee_recipient (a quote token account whose owner
+        // must be an official buyback wallet); the rest of the protocol fee and the creator fee stay
+        // in the vault and are proven by the vault identity
+        let (pf, cf) = match (get("buyback_fee_recipient"), bb) {
+            (Some(bta), Some(b)) => {
+                let owner = m.tokens.get(&bta).and_then(|t| t.owner.clone());
+                let official = owner.as_ref().is_some_and(|w| buyback_recipients().contains(w));
+                let got: i128 = token_credits_in(m, &bta, &sub).iter().map(|x| x.1).sum();
+                let pf = if b != 0 && !official {
+                    (Outcome::Fail, format!("buyback slice {b} paid to {} whose owner {} is not an official buyback wallet", short(&bta), owner.as_deref().map(short).unwrap_or("?".into())))
+                } else if got != b {
+                    (Outcome::Fail, format!("buyback token account {}: parsed credit {got} vs event buyback_fee {b} inside {here}", short(&bta)))
+                } else {
+                    match vault_ok {
+                        Some(true) => {
+                            routes.push("amm_v2:buyback_parsed+retained_in_vault".into());
+                            (Outcome::Pass, format!("protocol fee {protocol} = buyback slice {b} ({} bps; parsed to official {}'s ATA {}) + {} retained in the pool vault (vault identity proven)", s.buyback_fee_bps.unwrap_or(0), owner.as_deref().map(short).unwrap_or_default(), short(&bta), protocol - b))
+                        }
+                        Some(false) => (Outcome::Fail, format!("buyback slice {b} matches, but the pool vault identity failed")),
+                        None => (Outcome::Inconclusive, format!("buyback slice {b} matches, but the pool vault identity is not proven")),
+                    }
+                };
+                let cf = match vault_ok {
+                    Some(true) => (Outcome::Pass, format!("creator fee {creator} retained in the pool quote vault (v2; SDK Pool.creatorFees) — included exactly in the vault identity inside {here}")),
+                    _ => (Outcome::Inconclusive, format!("creator fee {creator} stays in the vault in v2; the vault identity is not proven")),
+                };
+                (pf, cf)
+            }
+            _ => (
+                (Outcome::Inconclusive, format!("{here}: buyback account or event buyback_fee missing")),
+                (Outcome::Inconclusive, format!("{here}: buyback account or event buyback_fee missing")),
+            ),
+        };
+        o.add(i, "swap.protocol_fee_observed", pf.0, true, pf.1);
+        o.add(i, "swap.creator_fee_observed", cf.0, true, cf.1);
+        return;
+    }
+    // v1: protocol fee = fee recipient token account + buyback token account (SDK remaining accounts:
+    // [cashback…] [pool_v2…] buyback wallet, buyback token account)
+    let pf = match get("protocol_fee_recipient_token_account") {
+        None => (Outcome::Inconclusive, format!("{here}: no protocol fee token account in the instruction")),
+        Some(pfta) => {
+            let rem: Vec<&String> = accts.iter().skip(def.accounts.len()).collect();
+            let bta = rem.iter().enumerate().find_map(|(k, w)| {
+                if !buyback_recipients().contains(*w) {
+                    return None;
+                }
+                rem.iter().skip(k + 1).find(|t| m.tokens.get(t.as_str()).and_then(|x| x.owner.as_deref()) == Some(w.as_str())).map(|t| ((*w).clone(), (*t).clone()))
+            });
+            let cp: i128 = token_credits_in(m, &pfta, &sub).iter().map(|x| x.1).sum();
+            let cb: i128 = bta.as_ref().map(|(_, t)| token_credits_in(m, t, &sub).iter().map(|x| x.1).sum()).unwrap_or(0);
+            let split = format!(
+                "protocol fee token account {}: {cp}{}",
+                short(&pfta),
+                bta.as_ref().map(|(w, t)| format!(" + buyback token account {} (owner {}, official buyback wallet, remaining account): {cb}", short(t), short(w))).unwrap_or_default()
+            );
+            if cp == 0 && cb == 0 && protocol != 0 {
+                (Outcome::Inconclusive, format!("{here}: no parsed fee transfer"))
+            } else if cp + cb != protocol {
+                (Outcome::Fail, format!("decoded protocol fee {protocol} vs parsed {} = {split} inside {here}", cp + cb))
+            } else if bb.is_some_and(|b| b != cb) {
+                (Outcome::Fail, format!("total matches ({split}) but buyback credit {cb} ≠ event buyback_fee {}", bb.unwrap()))
+            } else {
+                routes.push(format!("amm_v1:{}", if bta.is_some() { "fee_recipient+buyback_parsed" } else { "fee_recipient_parsed" }));
+                (Outcome::Pass, format!("decoded protocol fee {protocol} = {split}{} [parsed transfers inside {here}]", bb.map(|b| format!("; event buyback_fee {b} ({} bps)", s.buyback_fee_bps.unwrap_or(0))).unwrap_or_default()))
+            }
+        }
+    };
+    o.add(i, "swap.protocol_fee_observed", pf.0, true, pf.1);
+    let cf = match get("coin_creator_vault_ata") {
+        None if creator == 0 => (Outcome::Pass, "no coin creator fee".to_string()),
+        None => (Outcome::Inconclusive, format!("{here}: no coin_creator_vault_ata account")),
+        Some(cva) => {
+            let got: i128 = token_credits_in(m, &cva, &sub).iter().map(|x| x.1).sum();
+            if got == creator {
+                (Outcome::Pass, format!("coin creator vault ATA {}: parsed credit {got} = decoded creator fee inside {here}", short(&cva)))
+            } else {
+                (Outcome::Fail, format!("coin creator vault ATA {}: parsed credit {got} vs decoded creator fee {creator} inside {here}", short(&cva)))
+            }
+        }
+    };
+    o.add(i, "swap.creator_fee_observed", cf.0, true, cf.1);
+}
 
 // ------------------------------------------------------------------------------------------------
 // Attribution scope of balance-only evidence

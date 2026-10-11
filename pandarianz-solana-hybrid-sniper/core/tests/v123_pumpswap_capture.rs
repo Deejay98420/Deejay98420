@@ -158,6 +158,13 @@ async fn pumpswap_capture_saves_balanced_unique_swaps_within_budget() {
     assert_eq!(std::fs::read_to_string(dir.path().join("pscap0.json")).unwrap(), original);
     assert!(std::fs::read_dir(reports.path()).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("capture-pumpswap-")));
     assert!(stdout.contains("pumpswap") && stdout.contains("VENUES MAINNET-VERIFIED"), "{stdout}");
+    // intake accounting: irrelevant traffic and duplicates are counted separately from relevant swaps
+    assert!(stdout.contains("15 notifications — 2 irrelevant (not a PumpSwap Buy/Sell), 1 failed txs, 6 duplicate notifications; 6 relevant swaps (4 buys, 2 sells)"), "{stdout}");
+    assert!(stdout.contains("latency (measured): notification → fetch start p50"), "{stdout}");
+    let manifest = std::fs::read_dir(reports.path()).unwrap().flatten().find(|e| e.file_name().to_string_lossy().starts_with("capture-pumpswap-")).unwrap();
+    let m: Value = serde_json::from_str(&std::fs::read_to_string(manifest.path()).unwrap()).unwrap();
+    assert_eq!(m["intake"]["irrelevant"], 2);
+    assert!(m["saved"][0]["notification_received_us"].as_i64().is_some() && m["saved"][0]["fetch_finished_us"].as_i64().is_some());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

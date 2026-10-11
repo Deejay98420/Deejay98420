@@ -64,11 +64,12 @@ pub struct Selector {
     sells: VecDeque<String>,
     pub duplicates: u64,
     pub dropped: u64,
+    evicted: Vec<String>,
 }
 
 impl Selector {
     pub fn new(cap_per_side: usize, already_captured: impl IntoIterator<Item = String>) -> Self {
-        Self { cap_per_side: cap_per_side.max(1), seen: already_captured.into_iter().collect(), buys: VecDeque::new(), sells: VecDeque::new(), duplicates: 0, dropped: 0 }
+        Self { cap_per_side: cap_per_side.max(1), seen: already_captured.into_iter().collect(), buys: VecDeque::new(), sells: VecDeque::new(), duplicates: 0, dropped: 0, evicted: Vec::new() }
     }
     pub fn offer(&mut self, signature: &str, side: Side) -> Offer {
         if self.seen.contains(signature) {
@@ -81,7 +82,9 @@ impl Selector {
         };
         if q.len() >= self.cap_per_side {
             // keep the freshest candidates: drop the oldest queued one
-            q.pop_front();
+            if let Some(old) = q.pop_front() {
+                self.evicted.push(old);
+            }
             self.dropped += 1;
         }
         self.seen.insert(signature.to_string());
@@ -103,7 +106,36 @@ impl Selector {
         }
         None
     }
+    /// Candidates superseded by fresher ones since the last call (for bookkeeping of intake times).
+    pub fn take_evicted(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.evicted)
+    }
     pub fn queued(&self) -> (usize, usize) {
         (self.buys.len(), self.sells.len())
     }
+}
+
+/// Intake accounting of a notification stream (relevant vs irrelevant, and where relevant ones were lost).
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct IntakeStats {
+    pub notifications: u64,
+    /// not a PumpSwap Buy/Sell (other instructions, routers' own logs, deposits, …)
+    pub irrelevant: u64,
+    pub failed_tx: u64,
+    pub relevant_buys: u64,
+    pub relevant_sells: u64,
+    /// the same signature notified again
+    pub duplicate_notifications: u64,
+    /// relevant candidates lost because the bounded hand-off channel was full (backpressure)
+    pub relevant_dropped_backpressure: u64,
+}
+
+/// Percentiles (p50, p95, max) of a sample, in the sample's unit.
+pub fn percentiles(v: &mut [i64]) -> Option<(i64, i64, i64)> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_unstable();
+    let at = |q: f64| v[((v.len() - 1) as f64 * q).round() as usize];
+    Some((at(0.5), at(0.95), *v.last().unwrap()))
 }
