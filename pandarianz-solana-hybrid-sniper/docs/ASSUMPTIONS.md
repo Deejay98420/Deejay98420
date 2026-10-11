@@ -2,17 +2,31 @@
 
 ## Venue layouts
 
-Pump.fun and PumpSwap layouts are verified against the official IDLs (`fixtures/idl/`, with provenance and sha256) in `tests/idl_verification.rs`. They have not yet been verified against captured mainnet transactions (pending RPC access; see `fixtures/real/README.md`).
+Pump.fun and PumpSwap event layouts are verified against the official IDLs (`fixtures/idl/`, with provenance and sha256) in `tests/idl_verification.rs`. Instruction account layouts (names and order) come from the same IDLs (`fixtures/idl/*.ix-accounts.json`) and are used only to locate the accounts an observed instruction touched. **Neither venue is mainnet-verified yet**: that requires real transactions to pass `verify-fixtures` (V1.2.1 rules below).
 
-Open semantic assumptions that only real captures can settle (`tests/real_fixtures.rs` checks them):
+### Mainnet findings (first real run, 15 transactions) and how they are handled
 
-- **Curve `TradeEvent.sol_amount` is net of fees.** For observed execution checks, buyers pay `sol_amount + fee + creator_fee` and sellers receive `sol_amount − fees`.
-- **PumpSwap pool vault updates.** v2 trades may leave protocol/creator fees inside the vault and offset them in `virtual_quote_reserves`. Each swap event carries the absolute pre-trade reserves, so any drift self-corrects on the next event.
-- **Buyback and holder-reward fees** are taken to be slices of the protocol/creator fee, not extra charges. **Cashback** is treated as zero (conservative).
+- **Events are emitted twice.** Pump.fun instructions carry `event_authority` + `program` (Anchor `emit_cpi!`) and the program also logs the event (`Program data:`). Decoding both copies doubled trade amounts. Copies are merged by (venue, payload bytes, top-level instruction), one-to-one.
+- **Version-1 transactions** need `maxSupportedTransactionVersion: 1`; with 0 the RPC answers `-32015`.
+- **Token creation** mints the full supply (10^15 raw units for the standard 1B × 6 decimals) into the curve vault inside `create`. Conservation is now Σ balance changes = parsed minted − burned.
+- **Wallet-wide deltas are not trade deltas.** Checks now use the accounts of the emitting instruction (vault, user token account) and the token transfer executed inside it.
+
+### Accounting rules used by verification (each is a hard check unless noted)
+
+- **Token amount**: the SPL transfer inside the trade instruction between the curve vault and the user token account equals `token_amount`, in the direction of the instruction (`buy*` / `sell*`).
+- **Curve SOL**: on buys the bonding curve receives exactly `sol_amount` (net of fees); on sells it pays out exactly `sol_amount` (gross; the user, fee recipient and creator vault are paid from it). Rent for a curve created in the same transaction is taken from the parsed `createAccount`. If mainnet disagrees, the check fails and the report shows observed vs decoded — it is never relaxed.
+- **Protocol fee**: the fee recipient's balance change (minus movements outside the trade) equals Σ `fee`. With a buyback fee, two documented routings are tested — buyback additional to the protocol fee, or carved out of it — and the report names the one that matched. No match is a failure.
+- **Creator fee**: the creator vault's change equals Σ `creator_fee` (0 without a creator). For cashback coins a mismatch is *inconclusive* (routing undocumented), never a pass.
+- **Fee formula**: `fee = ceil(sol_amount × fee_bps / 10 000)` and the same for the creator fee (SDK `fees.ts`); PumpSwap LP / protocol / creator fees are `ceil(quote × bps / 10 000)` on the pre-fee quote (SDK `util.ts`). Mismatches report the implied rate.
+- **PumpSwap**: pool base / quote vault and user base account deltas; v1 protocol and coin-creator fee token accounts; constant-product output within 1 + 1 bp. v2 instructions have no per-fee recipient accounts, so v2 fee transfers are *inconclusive*; v2 vaults may retain protocol/creator fees (accepted only as that named routing).
+- **Inconclusive**, never pass: no inner-instruction record or call depth; unknown/older instruction layout; event count ≠ instruction count in a top-level instruction (e.g. `multi_hop_curve_swap`); an account changed by `syncNative` / native close / an unrecognised token instruction; non-SOL quote curves.
+- The user's wallet-wide SOL change is reported as information only (it also includes rent, tips and other instructions).
+
+Earlier assumptions still used by the paper engine: **buyback and holder-reward fees** are slices of the protocol/creator fee, not extra charges; **cashback** is treated as zero (conservative); PumpSwap swap events carry the absolute pre-trade reserves, so any drift self-corrects on the next event.
 
 ## Earlier layout notes
 
-- **Pump.fun (`6EF8…F6P`)**: Anchor `emit!` → `Program data:` logs. Events:
+- **Pump.fun (`6EF8…F6P`)**: Anchor `Program data:` logs (and, on current program versions, the same event again as a self-CPI — merged, see above). Events:
   - `CreateEvent` (name, symbol, uri, mint, bonding_curve, user; optional creator, timestamp, reserves, supply);
   - `TradeEvent` (mint, sol_amount, token_amount, is_buy, user, timestamp, virtual reserves; optional real reserves, fee recipient/bps/fee, creator fee fields);
   - `CompleteEvent`;

@@ -109,7 +109,7 @@ pub fn subscribe_requests(cfg: &WsConfig) -> Vec<String> {
         SubscriptionKind::Transactions { account_include } => vec![json!({
             "jsonrpc":"2.0","id":1,"method":"transactionSubscribe",
             "params":[{"accountInclude":account_include,"failed":false,"vote":false},
-                      {"commitment":c,"encoding":"jsonParsed","transactionDetails":"full","maxSupportedTransactionVersion":0}]
+                      {"commitment":c,"encoding":"jsonParsed","transactionDetails":"full","maxSupportedTransactionVersion":crate::rpc::max_tx_version()}]
         })
         .to_string()],
     };
@@ -131,13 +131,20 @@ pub fn parse_tx_object(tx: &Value, signature: Option<&str>, slot: u64, provider:
     let mut inner = Vec::new();
     if let Some(groups) = meta.get("innerInstructions").and_then(|g| g.as_array()) {
         for g in groups {
-            for ix in g.get("instructions").and_then(|i| i.as_array()).into_iter().flatten() {
+            let outer = g.get("index").and_then(|i| i.as_u64()).map(|i| i as u16);
+            for (pos, ix) in g.get("instructions").and_then(|i| i.as_array()).into_iter().flatten().enumerate() {
                 let (Some(pid), Some(data)) = (ix.get("programId").and_then(|p| p.as_str()), ix.get("data").and_then(|d| d.as_str())) else {
                     continue;
                 };
                 // jsonParsed encodes unparsed instruction data as base58
                 if let Ok(bytes) = bs58::decode(data).into_vec() {
-                    inner.push(InnerIx { program_id: pid.to_string(), data_b64: base64::engine::general_purpose::STANDARD.encode(bytes) });
+                    inner.push(InnerIx {
+                        program_id: pid.to_string(),
+                        data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                        outer_index: outer,
+                        position: Some(pos as u16),
+                        stack_height: ix.get("stackHeight").and_then(|h| h.as_u64()).map(|h| h.min(255) as u8),
+                    });
                 }
             }
         }

@@ -18,8 +18,17 @@ pub struct FetchStats {
     pub not_found: AtomicU64,
     pub errors: AtomicU64,
     pub dropped_queue_full: AtomicU64,
+    /// requests older than `FETCH_MAX_AGE` when their turn came (stale for trading → skipped)
+    pub expired: AtomicU64,
+    /// signatures already fetched / in progress
+    pub duplicates: AtomicU64,
+    /// requests the shared RPC scheduler refused to send (queue full / budget / wait expired)
+    pub deferred_rejected: AtomicU64,
     pub total_fetch_us: AtomicU64,
 }
+
+/// A logs-only notification older than this is not worth a getTransaction for live trading.
+pub const FETCH_MAX_AGE: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Serialize, Clone, Default)]
 pub struct FetchSnapshot {
@@ -27,6 +36,9 @@ pub struct FetchSnapshot {
     pub fetched: u64,
     pub not_found: u64,
     pub errors: u64,
+    pub expired: u64,
+    pub duplicates: u64,
+    pub deferred_rejected: u64,
     pub mean_fetch_ms: Option<f64>,
 }
 
@@ -38,6 +50,9 @@ impl FetchStats {
             fetched: f,
             not_found: self.not_found.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
+            expired: self.expired.load(Ordering::Relaxed),
+            duplicates: self.duplicates.load(Ordering::Relaxed),
+            deferred_rejected: self.deferred_rejected.load(Ordering::Relaxed),
             mean_fetch_ms: if f > 0 { Some(self.total_fetch_us.load(Ordering::Relaxed) as f64 / f as f64 / 1e3) } else { None },
         }
     }
@@ -48,9 +63,27 @@ impl FetchStats {
 pub fn spawn_fetcher(rpc: Arc<RpcClient>, ingestor: Ingestor, mut rx: mpsc::Receiver<FetchReq>, concurrency: usize, stats: Arc<FetchStats>) {
     let sem = Arc::new(Semaphore::new(concurrency.max(1)));
     tokio::spawn(async move {
+        // bounded memory of recent signatures (dedupe across providers / repeated notifications)
+        let mut seen: std::collections::HashSet<String> = Default::default();
+        let mut order: std::collections::VecDeque<String> = Default::default();
         while let Some(req) = rx.recv().await {
             stats.requested.fetch_add(1, Ordering::Relaxed);
+            if !seen.insert(req.signature.clone()) {
+                stats.duplicates.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            order.push_back(req.signature.clone());
+            if order.len() > 20_000 {
+                if let Some(old) = order.pop_front() {
+                    seen.remove(&old);
+                }
+            }
             let permit = sem.clone().acquire_owned().await.expect("semaphore");
+            // freshest first: anything that waited too long is no longer useful for live decisions
+            if wall_us() - req.first_seen_us > FETCH_MAX_AGE.as_micros() as i64 {
+                stats.expired.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             let (rpc, ing, st) = (rpc.clone(), ingestor.clone(), stats.clone());
             tokio::spawn(async move {
                 let _p = permit;
@@ -65,11 +98,21 @@ pub fn spawn_fetcher(rpc: Arc<RpcClient>, ingestor: Ingestor, mut rx: mpsc::Rece
                             let _ = ing.push(StreamMsg::Event(ev)).await;
                             return;
                         }
+                        // not yet queryable at this commitment: short wait (the scheduler paces requests)
                         Ok(None) => tokio::time::sleep(Duration::from_millis(250 * (attempt as u64 + 1))).await,
+                        Err(e) if e.not_sent() => {
+                            st.deferred_rejected.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
                         Err(e) => {
                             tracing::debug!(error = %e, "getTransaction failed");
-                            tokio::time::sleep(Duration::from_millis(300 * (attempt as u64 + 1))).await;
+                            st.errors.fetch_add(1, Ordering::Relaxed);
+                            return;
                         }
+                    }
+                    if wall_us() - req.first_seen_us > FETCH_MAX_AGE.as_micros() as i64 {
+                        st.expired.fetch_add(1, Ordering::Relaxed);
+                        return;
                     }
                 }
                 st.not_found.fetch_add(1, Ordering::Relaxed);
@@ -195,7 +238,45 @@ pub struct LiveSetup {
 }
 
 fn env_list(k: &str) -> Vec<String> {
-    std::env::var(k).unwrap_or_default().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+    endpoint_list(&std::env::var(k).unwrap_or_default(), &["wss", "ws", "https", "http"])
+}
+
+/// RPC endpoints from the environment: SOLANA_RPC_URLS (or SOLANA_RPC_URL), else derived from the
+/// WebSocket URLs (most providers serve both on the same host/key). Placeholders are ignored.
+pub fn rpc_urls_from_env() -> Vec<String> {
+    let rpc = endpoint_list(&std::env::var("SOLANA_RPC_URLS").or_else(|_| std::env::var("SOLANA_RPC_URL")).unwrap_or_default(), &["https", "http"]);
+    if !rpc.is_empty() {
+        return rpc;
+    }
+    endpoint_list(&std::env::var("SOLANA_WS_URLS").or_else(|_| std::env::var("SOLANA_WS_URL")).unwrap_or_default(), &["wss", "ws"]).iter().filter_map(|u| ws_to_http(u)).collect()
+}
+
+/// Comma-separated endpoint list → usable URLs only: empty entries, `.env.example` placeholders
+/// (`<...>`) and unparsable / wrong-scheme URLs are dropped (so they never count as "configured").
+pub fn endpoint_list(v: &str, schemes: &[&str]) -> Vec<String> {
+    v.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && !s.contains('<') && !s.contains('>'))
+        .filter(|s| url::Url::parse(s).map(|u| schemes.contains(&u.scheme()) && u.host_str().is_some()).unwrap_or(false))
+        .collect()
+}
+
+/// Redacted, honest status of one endpoint variable (never prints keys).
+pub fn endpoint_status(var: &str, schemes: &[&str]) -> (usize, String) {
+    let raw = std::env::var(var).unwrap_or_default();
+    let ok = endpoint_list(&raw, schemes);
+    let entries = raw.split(',').filter(|s| !s.trim().is_empty()).count();
+    let hosts: Vec<String> = ok.iter().map(|u| crate::stream::ws::redact_url(u)).collect();
+    let msg = if raw.trim().is_empty() {
+        "NOT CONFIGURED (empty)".to_string()
+    } else if ok.is_empty() {
+        format!("NOT CONFIGURED ({entries} entr{} but none usable: placeholder or invalid URL)", if entries == 1 { "y" } else { "ies" })
+    } else if ok.len() < entries {
+        format!("{} usable endpoint(s) {hosts:?}; {} entr{} ignored (placeholder/invalid)", ok.len(), entries - ok.len(), if entries - ok.len() == 1 { "y" } else { "ies" })
+    } else {
+        format!("{} usable endpoint(s) {hosts:?}", ok.len())
+    };
+    (ok.len(), msg)
 }
 fn env_num<T: std::str::FromStr>(k: &str, d: T) -> T {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
@@ -284,7 +365,9 @@ impl LiveSetup {
         if self.rpc_urls.is_empty() {
             return Ok(None);
         }
-        Ok(Some(Arc::new(RpcClient::new(self.rpc_urls.clone(), Duration::from_secs(8), self.rpc_rate_per_s, (self.rpc_rate_per_s as u32).max(2) * 2)?)))
+        // ONE scheduler per process: fetcher, backfill and mint/pool checks share its budget
+        let cfg = crate::rpc::SchedulerConfig { rate_per_s: self.rpc_rate_per_s, timeout: Duration::from_secs(8), ..crate::rpc::SchedulerConfig::from_env() };
+        Ok(Some(Arc::new(RpcClient::with_config(self.rpc_urls.clone(), cfg)?)))
     }
 }
 

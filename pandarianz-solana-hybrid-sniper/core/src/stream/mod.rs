@@ -20,6 +20,14 @@ use tokio::sync::mpsc;
 pub struct InnerIx {
     pub program_id: String,
     pub data_b64: String,
+    /// Top-level instruction this inner instruction ran under (`innerInstructions[].index`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outer_index: Option<u16>,
+    /// Position within that top-level instruction's inner list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack_height: Option<u8>,
 }
 
 /// One transaction as delivered by a provider.

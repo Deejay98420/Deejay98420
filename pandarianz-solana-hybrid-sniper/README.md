@@ -1,4 +1,4 @@
-# pandarianz-solana-hybrid-sniper (v1.2)
+# pandarianz-solana-hybrid-sniper (v1.2.1)
 
 A **PAPER-ONLY** Solana memecoin launch sniper and momentum trader. It has an event-driven Rust core, PostgreSQL persistence with a replayable journal, and a read-only Next.js dashboard.
 
@@ -74,16 +74,31 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the modules and [docs/ASSUM
 ## One command (Mac)
 
 ```bash
-./scripts/sniper check
+./scripts/sniper check                                                   # no network capture
+./scripts/sniper check --capture 25 --max-requests 150 --max-seconds 300 # + bounded mainnet capture
 ```
 
-`check` runs these steps in order:
+`check` runs these steps in order and never trades, signs or sends anything:
 
-1. Verifies tools and `.env` (values are never printed).
-2. Builds the project and runs every automated test plus the PAPER-only safety check.
-3. Probes each configured provider with `doctor`: connection, which subscriptions are accepted or rejected, and PumpSwap coverage.
-4. Captures real mainnet transactions and verifies the decoders against transaction evidence.
-5. Prints the **single next required action**.
+1. Verifies tools and `.env` (values are never printed; empty or placeholder endpoints are reported as NOT CONFIGURED).
+2. PAPER-only static safety check.
+3. Builds and runs every automated regression test.
+4. Re-verifies the transactions already captured in `fixtures/real/` (files are only read).
+5. Provider diagnostics (`endpoints` + `doctor`).
+6. Optional bounded mainnet capture (`--capture N`): stops at the target, the request budget or the time limit.
+7. Final verification report per venue (`reports/verification/`), then the **single next required action**.
+
+## V1.2.1: mainnet repair
+
+Fixes for the defects found on the first real mainnet run:
+
+- **Version-1 transactions.** `getTransaction` / `transactionSubscribe` send `maxSupportedTransactionVersion: 1` (env `SOLANA_MAX_TX_VERSION`, default 1); v0/v1 `loadedAddresses` are part of the account list; responses are structurally validated and kept verbatim, with the transaction version recorded.
+- **One quota-aware request scheduler** (`rpc.rs`) shared by live fetches, backfill, mint/pool checks, capture and verification: callers wait for rate-limit capacity (bounded by `max_wait`) instead of failing; HTTP 429 honours `Retry-After`, else exponential backoff with jitter, and cools down the whole client; bounded in-flight requests and a bounded queue (excess calls are rejected, never queued without limit); optional request budget; identical concurrent requests share one HTTP call. Sent / ok / 429 / retried / deferred / expired / rejected / deduplicated are counted separately.
+- **Bounded capture.** `capture --from-live N` saves N *new, unique, successfully fetched* transactions with venue events, newest first, balanced across Pump.fun and PumpSwap, within `--max-requests` / `--max-seconds`, and explains why it stopped. Existing fixture files are never modified (`create_new`); reports go to `reports/verification/`.
+- **Doubled Pump.fun amounts.** Root cause: Pump.fun emits each `TradeEvent` both as a `Program data:` log and as an Anchor self-CPI inner instruction; both copies were decoded, so one trade counted twice. Copies are now merged when venue, payload bytes and top-level instruction match (one-to-one, so genuinely repeated trades survive). Every event carries provenance (channel, top-level instruction, inner position, call depth) and a stable id `signature:outer:inner:ordinal`.
+- **Instruction-level accounting** (`verify.rs`, `txmodel.rs`, `ixlayout.rs`). Each event is tied to the instruction that emitted it; its accounts come from the official IDL instruction layouts (`fixtures/idl/*.ix-accounts.json`). Checks use the token transfer executed inside that instruction, the specific curve vault / user token account / pool vaults, lamports of the curve, fee recipient and creator vault, and per-mint conservation **Σ balance changes = minted − burned** from parsed `mintTo`/`burn` (token creation is minted supply, not a violation). Movements by other instructions (account creation rent, unrelated transfers) are accounted for explicitly. Fee routing is tested against named hypotheses and the one that matched is reported.
+- **Pass / Fail / Inconclusive.** Missing or ambiguous evidence (no inner-instruction record, unknown layout, several trades in one multi-hop instruction, an account changed without an exact parsed amount) is *inconclusive* and never counts as a pass. A venue is **mainnet-verified** only when no hard check fails and at least 5 trade events (≥1 buy and ≥1 sell) pass every hard check.
+- **Per-venue report**: unique signatures, events decoded, duplicate emissions merged, checks passed / failed / inconclusive, failures by check with examples, fee hypotheses, transaction versions, provenance. Raydium stays disabled.
 
 ## V1.2: real-data evidence
 
@@ -96,7 +111,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the modules and [docs/ASSUM
   - the curve invariant
   - SOL deltas (a soft check)
 
-  Captures keep their signature, slot and block time, and are classified as launch, trade, curve completion, migration, pool creation, swap or liquidity. A layout counts as **mainnet-verified** only with at least 5 events and zero hard-check failures. The engine reads `fixtures/real/verification.json`.
+  Captures keep their signature, slot and block time, and are classified as launch, trade, curve completion, migration, pool creation, swap or liquidity. (V1.2.1 replaced these checks with instruction-level ones; see above. The engine reads `reports/verification/verification.json`.)
 - **Execution realism.** The v1.1 next-trade comparison used a future trade. It now compares only with the latest same-side trade **at or before** the fill. Every fill is classified **validated** or **unverified**, with reasons. Validated requires:
   - LIVE data
   - a mainnet-verified decoder for the venue
@@ -144,7 +159,7 @@ Labels cannot be crossed: the fixture loader relabels everything as FIXTURE, a l
 | Pump.fun Create/Trade/Complete/Migration events, BondingCurve account | **IDL-verified** | Official IDL from `@pump-fun/pump-sdk@4.0.0` (`fixtures/idl/`). A generic IDL-driven encoder is checked against our decoders in `tests/idl_verification.rs`. Curve math is ported from the SDK's `bondingCurve.ts` / `fees.ts`. |
 | PumpSwap CreatePool/Buy/Sell/Deposit/Withdraw events, Pool account | **IDL-verified** | Official IDL from `@pump-fun/pump-swap-sdk@2.1.0`. AMM math (with `virtual_quote_reserves` and per-component fees) is ported from the SDK's `buy.ts` / `sell.ts`. |
 | Raydium AMM v4 `ray_log` | **unverified**, decode-only | Never traded. |
-| Captured mainnet transactions | **pending** | No RPC access from the build environment. `sniper capture` and `tests/real_fixtures.rs` are ready; the harness is self-tested. |
+| Captured mainnet transactions | **not verified** | The first real run (15 transactions, on the user's machine) exposed the defects fixed in V1.2.1. Neither venue is mainnet-verified until `./scripts/sniper check --capture 25` passes on real data. |
 
 The IDL check found and fixed real issues relative to v1.0:
 
@@ -155,7 +170,12 @@ The IDL check found and fixed real issues relative to v1.0:
 
 ## Tests
 
-`./scripts/sniper test` runs 98 tests, plus the static check and the dashboard typecheck/build. V1.2 adds:
+`./scripts/sniper test` runs 116 tests, plus the static check and the dashboard typecheck/build. V1.2.1 adds:
+
+- `v121_mainnet_repair` (18): IDL instruction-layout provenance; version 0/1/legacy transactions and lookup-table accounts; structural validation; log+CPI duplicate merge (the doubled-amount regression); repeated genuine trades in one transaction; token creation in conservation; fee reconciliation (observed transfers and SDK formula); missing evidence → inconclusive, never verified; wrong direction; HTTP 429 with `Retry-After`; bounded retries; `-32015` classification; bounded queue; request budget and wait limit; in-flight dedupe; placeholder endpoints; `capture` under 429 pressure stopping cleanly within its budget.
+- `v12_evidence` and `real_fixtures` rewritten on realistic synthetic transactions (`txbuild.rs`: instruction tree, parsed transfers, double emission); `real_fixtures` re-verifies `fixtures/real/` read-only (hashes before/after).
+
+V1.2 added:
 
 - `v12_evidence` (9): transaction-evidence verification of curve trades and PumpSwap swaps, including that tampered events are caught; the mainnet-verified summary; explicit subscription capability checks (a rejected `transactionSubscribe` never reports "Subscribed"); doctor probes against mock providers with key scrubbing; fixture fills never validating; validated-fill rules; sensitivity monotonicity; the fixed split; and the end-to-end `capture` CLI with provenance and no key leakage.
 - Unit tests: secret scrubbing (found and fixed a leak of key-bearing path segments) and the doctor assessment.
@@ -186,7 +206,7 @@ V1.1 suites:
 **Not verified / blocked:**
 
 - **LIVE mainnet streaming has NOT been run.** No provider credentials were available, and the build container's egress policy blocks Solana RPC and Jupiter. Every live adapter is tested end-to-end against local mock providers that use the real RPC JSON shapes. Mainnet validation is the first `verify-live` run on your machine.
-- **No decoder has been checked against a captured mainnet transaction yet.** They are checked against the official IDLs and SDK math (strong, but not the same thing). Run `capture` first.
+- **No venue is mainnet-verified.** The V1.2.1 checks were validated on realistic synthetic transactions built to mirror the jsonParsed format, not on your 15 captured mainnet files, which are not in this repository. Run `./scripts/sniper check --capture 25` to re-verify them and capture more.
 - **Raydium v4 is decode-only.** `ray_log` has no pool or mint ids.
 - **Docker Compose was not exercised here** (no Docker daemon in the container). The same scripts were run against a local PostgreSQL 16.
 - **Latency figures** come from this machine on fixture data. The provider-lag and queue-wait series only fill in LIVE mode.

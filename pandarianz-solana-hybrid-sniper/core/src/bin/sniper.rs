@@ -75,26 +75,45 @@ enum Cmd {
         #[arg(long, default_value = "../reports")]
         out: PathBuf,
     },
-    /// Verify captured real transactions against transaction evidence; writes fixtures/real/verification.json.
+    /// Verify captured real transactions against transaction evidence. Fixture files are only read;
+    /// reports go to --report-dir.
     VerifyFixtures {
         #[arg(long, default_value = "../fixtures/real")]
         dir: PathBuf,
+        #[arg(long, default_value = "../reports/verification")]
+        report_dir: PathBuf,
     },
     /// Calibration-split analysis of the expected-move model (read-only; never changes config).
     Calibrate {
         #[arg(long)]
         profile: String,
     },
-    /// Capture real mainnet transactions (read-only getTransaction) as regression fixtures.
+    /// Capture real mainnet transactions (read-only getTransaction) as regression fixtures. Bounded:
+    /// stops at the target, the request budget or the time limit, whichever comes first. Existing
+    /// fixture files are never modified or replaced.
     Capture {
         /// comma-separated signatures to capture
         #[arg(long, value_delimiter = ',')]
         signatures: Vec<String>,
-        /// or: sample N recent signatures per supported program
+        /// or: target number of NEW unique transactions (with venue events) to save from recent activity
         #[arg(long)]
         from_live: Option<usize>,
+        /// maximum HTTP requests (including retries) this capture may send
+        #[arg(long, default_value_t = 150)]
+        max_requests: u64,
+        /// wall-clock limit in seconds
+        #[arg(long, default_value_t = 180)]
+        max_seconds: u64,
+        /// request rate limit (requests/second) shared by every request of this capture
+        #[arg(long, default_value_t = 2.0)]
+        rate: f64,
+        /// concurrent requests
+        #[arg(long, default_value_t = 2)]
+        concurrency: usize,
         #[arg(long, default_value = "../fixtures/real")]
         out: PathBuf,
+        #[arg(long, default_value = "../reports/verification")]
+        report_dir: PathBuf,
     },
     /// Re-run a recorded journal (PostgreSQL) through the current strategy as REPLAY data.
     Replay {
@@ -112,6 +131,8 @@ enum Cmd {
     },
     /// Apply database migrations.
     Migrate,
+    /// Show which provider endpoints are actually usable (redacted; keys are never printed).
+    Endpoints,
     /// Query a running engine's health endpoint.
     Status {
         #[arg(long, env = "SNIPER_API_ADDR", default_value = "127.0.0.1:8787")]
@@ -216,9 +237,32 @@ async fn main() -> anyhow::Result<()> {
             println!("full report: {}", path.display());
             Ok(())
         }
-        Cmd::Capture { signatures, from_live, out } => capture(signatures, from_live, out).await,
+        Cmd::Endpoints => {
+            use sniper_core::live::endpoint_status;
+            let (ws, m1) = endpoint_status(if std::env::var("SOLANA_WS_URLS").is_ok() { "SOLANA_WS_URLS" } else { "SOLANA_WS_URL" }, &["wss", "ws"]);
+            let (rpc, m2) = endpoint_status(if std::env::var("SOLANA_RPC_URLS").is_ok() { "SOLANA_RPC_URLS" } else { "SOLANA_RPC_URL" }, &["https", "http"]);
+            let (_, m3) = endpoint_status("JUPITER_QUOTE_URL", &["https", "http"]);
+            println!("SOLANA_WS_URLS     {m1}");
+            if rpc == 0 && ws > 0 {
+                println!("SOLANA_RPC_URLS    {m2} → RPC derived from the WebSocket URL(s) (same host and key)");
+            } else {
+                println!("SOLANA_RPC_URLS    {m2}");
+            }
+            println!("JUPITER_QUOTE_URL  {m3} (optional)");
+            println!("maxSupportedTransactionVersion = {}", sniper_core::rpc::max_tx_version());
+            if ws == 0 {
+                std::process::exit(3);
+            }
+            Ok(())
+        }
+        Cmd::Capture { signatures, from_live, max_requests, max_seconds, rate, concurrency, out, report_dir } => {
+            let lim = CaptureLimits { max_requests, max_seconds, rate, concurrency };
+            capture(signatures, from_live, lim, out, report_dir).await
+        }
         Cmd::Doctor { listen_seconds, out } => doctor(listen_seconds, out).await,
-        Cmd::VerifyFixtures { dir } => verify_fixtures(&dir, EngineConfig::load(std::env::var("SNIPER_CONFIG").ok().map(PathBuf::from).as_deref())?.evidence.min_events_for_mainnet_verified),
+        Cmd::VerifyFixtures { dir, report_dir } => {
+            verify_fixtures(&dir, &report_dir, EngineConfig::load(std::env::var("SNIPER_CONFIG").ok().map(PathBuf::from).as_deref())?.evidence.min_events_for_mainnet_verified).map(|_| ())
+        }
         Cmd::Calibrate { profile } => calibrate(&profile).await,
     }
 }
@@ -272,9 +316,9 @@ async fn run_engine(
     };
     let fetch_stats = Arc::new(sniper_core::live::FetchStats::default());
     engine.live = sniper_core::engine::LiveServices { rpc: rpc.clone(), fetch_stats: Some(fetch_stats.clone()), backfill: None };
-    engine.decoder_verification = sniper_core::verify::load_summary(std::path::Path::new("../fixtures/real/verification.json"));
+    engine.decoder_verification = sniper_core::verify::load_default_summary();
     if engine.decoder_verification.is_none() {
-        tracing::warn!("no fixtures/real/verification.json: decoders are IDL-verified only; every fill is marked unverified");
+        tracing::warn!("no decoder verification report (reports/verification/verification.json): decoders are IDL-verified only; every fill is marked unverified");
     }
     engine.warmup(&warm);
     engine.boot(cfg_json).await;
@@ -531,125 +575,332 @@ fn live_report(s: &Snapshot, seconds: u64) -> serde_json::Value {
     })
 }
 
-async fn capture(signatures: Vec<String>, from_live: Option<usize>, out: PathBuf) -> anyhow::Result<()> {
-    let setup = sniper_core::live::LiveSetup::from_env()?;
-    let rpc = setup.rpc()?.context("capture needs an RPC endpoint (SOLANA_RPC_URLS or a derivable SOLANA_WS_URLS)")?;
+struct CaptureLimits {
+    max_requests: u64,
+    max_seconds: u64,
+    rate: f64,
+    concurrency: usize,
+}
+
+/// Signatures already captured in `dir` (file stems and recorded signatures). Read-only.
+fn existing_signatures(dir: &std::path::Path) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    for p in std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()) {
+        if p.extension().is_some_and(|x| x == "json") {
+            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                set.insert(stem.to_string());
+            }
+        }
+    }
+    set
+}
+
+#[derive(Default)]
+struct CaptureTally {
+    saved: usize,
+    saved_by_program: std::collections::BTreeMap<&'static str, usize>,
+    by_type: std::collections::BTreeMap<String, usize>,
+    already_captured: usize,
+    failed_on_chain: usize,
+    not_found: usize,
+    no_venue_events: usize,
+    invalid_structure: usize,
+    errors: std::collections::BTreeMap<String, usize>,
+    error_examples: Vec<String>,
+    versions: std::collections::BTreeMap<String, usize>,
+    requeued: usize,
+}
+
+async fn capture(signatures: Vec<String>, from_live: Option<usize>, lim: CaptureLimits, out: PathBuf, report_dir: PathBuf) -> anyhow::Result<()> {
+    use sniper_core::rpc::{RpcClient, RpcError, SchedulerConfig};
+    let rpc_urls = sniper_core::live::rpc_urls_from_env();
+    anyhow::ensure!(!rpc_urls.is_empty(), "capture needs an RPC endpoint (SOLANA_RPC_URLS, or SOLANA_WS_URLS from which it is derived)");
+    anyhow::ensure!(lim.rate > 0.0 && lim.concurrency > 0 && lim.max_requests > 0, "--rate, --concurrency and --max-requests must be positive");
+    let explicit = !signatures.is_empty();
+    let target = if explicit { signatures.len() } else { from_live.context("nothing to capture: pass --signatures or --from-live N")? };
+    let t0 = std::time::Instant::now();
+    let deadline = t0 + Duration::from_secs(lim.max_seconds);
+    let cfg = SchedulerConfig {
+        rate_per_s: lim.rate,
+        burst: (lim.rate.ceil() as u32).max(1),
+        max_in_flight: lim.concurrency,
+        max_queue: lim.concurrency * 4,
+        max_wait: Duration::from_secs(lim.max_seconds.clamp(1, 30)),
+        request_budget: Some(lim.max_requests),
+        timeout: Duration::from_secs(15),
+        ..SchedulerConfig::default()
+    };
+    let rpc = Arc::new(RpcClient::with_config(rpc_urls.clone(), cfg)?);
     std::fs::create_dir_all(&out)?;
-    let mut sigs: Vec<String> = signatures;
-    let mut want: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
-    if let Some(n) = from_live {
-        // sample widely, then keep a diverse set: every launch / completion / migration found + up to n trades per venue
-        for prog in [programs::PUMP_FUN, programs::PUMP_SWAP] {
-            let mut before: Option<String> = None;
-            for _ in 0..4 {
-                let page = rpc.get_signatures_for_address(prog, 250, before.as_deref()).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                before = page.last().map(|s| s.signature.clone());
-                sigs.extend(page.into_iter().filter(|s| !s.failed).map(|s| s.signature));
-                if before.is_none() {
-                    break;
+    let existing = existing_signatures(&out);
+    println!(
+        "CAPTURE (read-only getTransaction, maxSupportedTransactionVersion={}): target {target} new transactions, ≤{} requests, ≤{}s, {} req/s, concurrency {}; {} already in {}",
+        rpc.max_tx_version,
+        lim.max_requests,
+        lim.max_seconds,
+        lim.rate,
+        lim.concurrency,
+        existing.len(),
+        out.display()
+    );
+    let mut tally = CaptureTally::default();
+    // candidate queues per program (newest first); explicit signatures go to a single queue
+    let progs: Vec<&'static str> = if explicit { vec!["explicit"] } else { vec![programs::PUMP_FUN, programs::PUMP_SWAP] };
+    let mut queues: std::collections::BTreeMap<&'static str, std::collections::VecDeque<String>> = progs.iter().map(|p| (*p, Default::default())).collect();
+    let mut cursors: std::collections::BTreeMap<&'static str, Option<String>> = Default::default();
+    let mut exhausted: std::collections::HashSet<&'static str> = Default::default();
+    let mut seen: std::collections::HashSet<String> = Default::default();
+    if explicit {
+        for s in signatures {
+            if existing.contains(&s) {
+                tally.already_captured += 1;
+            } else if seen.insert(s.clone()) {
+                queues.get_mut("explicit").unwrap().push_back(s);
+            }
+        }
+        exhausted.insert("explicit");
+    }
+    let label = |p: &str| match p {
+        programs::PUMP_FUN => "pump",
+        programs::PUMP_SWAP => "pumpswap",
+        _ => "explicit",
+    };
+    let mut retry_once: std::collections::HashSet<String> = Default::default();
+    let stop_reason: String = loop {
+        if tally.saved >= target {
+            break "target reached".into();
+        }
+        if std::time::Instant::now() >= deadline {
+            break format!("time limit ({}s) reached", lim.max_seconds);
+        }
+        if rpc.budget_remaining() == Some(0) {
+            break format!("request budget ({}) spent", lim.max_requests);
+        }
+        // pick the program with the fewest saved transactions that still has (or can list) candidates
+        let mut order: Vec<&'static str> = progs.clone();
+        order.sort_by_key(|p| tally.saved_by_program.get(label(p)).copied().unwrap_or(0));
+        let Some(prog) = order.into_iter().find(|p| !queues[p].is_empty() || !exhausted.contains(p)) else {
+            break "no more candidate signatures".into();
+        };
+        if queues[prog].is_empty() {
+            // one page of the newest signatures (successful only, not yet captured, not seen)
+            match rpc.get_signatures_for_address(prog, 40, cursors.get(prog).cloned().flatten().as_deref()).await {
+                Ok(page) => {
+                    if page.is_empty() {
+                        exhausted.insert(prog);
+                    }
+                    cursors.insert(prog, page.last().map(|s| s.signature.clone()));
+                    for s in page {
+                        if s.failed {
+                            tally.failed_on_chain += 1;
+                        } else if existing.contains(&s.signature) {
+                            tally.already_captured += 1;
+                        } else if seen.insert(s.signature.clone()) {
+                            queues.get_mut(prog).unwrap().push_back(s.signature);
+                        }
+                    }
+                }
+                Err(e) => {
+                    *tally.errors.entry(format!("getSignaturesForAddress {}", e.class())).or_default() += 1;
+                    if tally.error_examples.len() < 3 {
+                        tally.error_examples.push(format!("getSignaturesForAddress({}): {e}", label(prog)));
+                    }
+                    if matches!(e, RpcError::BudgetExhausted) {
+                        continue;
+                    }
+                    if !e.not_sent() {
+                        exhausted.insert(prog); // do not hammer a failing listing
+                    }
+                }
+            }
+            continue;
+        }
+        // fetch a small batch concurrently (never more than still needed)
+        let need = target - tally.saved;
+        let batch: Vec<String> = (0..lim.concurrency.min(need).max(1)).filter_map(|_| queues.get_mut(prog).unwrap().pop_front()).collect();
+        let results = futures_util::future::join_all(batch.iter().map(|sig| {
+            let rpc = rpc.clone();
+            let sig = sig.clone();
+            async move { (sig.clone(), rpc.get_transaction_raw(&sig).await) }
+        }))
+        .await;
+        for (sig, res) in results {
+            match res {
+                Ok(raw) if raw.is_null() => tally.not_found += 1,
+                Ok(raw) => {
+                    let problems = sniper_core::txmodel::structure_problems(&raw);
+                    if !problems.is_empty() {
+                        tally.invalid_structure += 1;
+                        if tally.error_examples.len() < 3 {
+                            tally.error_examples.push(format!("{}…: invalid response: {}", &sig[..8.min(sig.len())], problems.join(", ")));
+                        }
+                        continue;
+                    }
+                    let v = sniper_core::verify::verify_tx(&raw, &sig);
+                    if v.tx_failed {
+                        tally.failed_on_chain += 1;
+                        continue;
+                    }
+                    if v.items.is_empty() {
+                        tally.no_venue_events += 1;
+                        continue;
+                    }
+                    if tally.saved >= target {
+                        break;
+                    }
+                    let doc = serde_json::json!({
+                        "provenance": {"source": "getTransaction (jsonParsed)", "captured_at_us": wall_us(), "network": "mainnet-beta",
+                            "request": {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": rpc.max_tx_version},
+                            "transaction_version": v.version, "slot": v.slot, "block_time": v.block_time, "classification": v.classification,
+                            "sampled_from": label(prog),
+                            "note": "REAL mainnet transaction captured read-only; full RPC result preserved verbatim"},
+                        "signature": sig,
+                        "rpc_result": raw,
+                    });
+                    // create_new: an existing fixture is never modified or replaced
+                    let path = out.join(format!("{sig}.json"));
+                    match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                        Ok(mut f) => {
+                            use std::io::Write;
+                            f.write_all(serde_json::to_string_pretty(&doc)?.as_bytes())?;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                            tally.already_captured += 1;
+                            continue;
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                    tally.saved += 1;
+                    *tally.saved_by_program.entry(label(prog)).or_default() += 1;
+                    *tally.versions.entry(v.version.clone()).or_default() += 1;
+                    for c in v.classification {
+                        *tally.by_type.entry(c).or_default() += 1;
+                    }
+                }
+                Err(e) => {
+                    *tally.errors.entry(e.class()).or_default() += 1;
+                    if tally.error_examples.len() < 3 && !tally.error_examples.iter().any(|x| x.contains(&e.class())) {
+                        tally.error_examples.push(format!("{}…: [{}] {e}", &sig[..8.min(sig.len())], e.class()));
+                    }
+                    // a request the scheduler deferred past its wait limit gets one more chance
+                    if matches!(e, RpcError::Expired(_) | RpcError::QueueFull) && retry_once.insert(sig.clone()) {
+                        tally.requeued += 1;
+                        queues.get_mut(prog).unwrap().push_back(sig);
+                    }
                 }
             }
         }
-        want.insert("trade_buy", n);
-        want.insert("trade_sell", n);
-        want.insert("pool_swap_buy", n);
-        want.insert("pool_swap_sell", n);
-        want.insert("launch", n);
-        want.insert("curve_complete", n);
-        want.insert("migration", n);
-        want.insert("pool_create", n);
-        want.insert("liquidity", n);
+    };
+    let st = rpc.scheduler_stats();
+    println!(
+        "CAPTURE RESULT: saved {}/{target} new unique transactions {:?} in {:.0}s — stop reason: {stop_reason}",
+        tally.saved,
+        tally.saved_by_program,
+        t0.elapsed().as_secs_f64()
+    );
+    println!("  by type {:?}; tx versions {:?}", tally.by_type, tally.versions);
+    println!(
+        "  skipped: {} already captured, {} failed on chain, {} without venue events, {} not found, {} invalid responses",
+        tally.already_captured, tally.failed_on_chain, tally.no_venue_events, tally.not_found, tally.invalid_structure
+    );
+    println!(
+        "  requests: {} sent / budget {} (ok {}, http 429 {}, retries {}, cooldowns {}); deferred {}, expired {}, rejected (queue) {}, rejected (budget) {}, requeued {}",
+        st.http_sent, lim.max_requests, st.ok, st.http_429, st.retries, st.cooldowns, st.deferred, st.expired, st.queue_rejected, st.budget_rejected, tally.requeued
+    );
+    if !tally.errors.is_empty() {
+        println!("  errors by class: {:?}", tally.errors);
+        let secrets: Vec<String> = rpc_urls.clone();
+        for e in &tally.error_examples {
+            println!("    e.g. {}", sniper_core::doctor::scrub(e, &secrets));
+        }
     }
-    anyhow::ensure!(!sigs.is_empty(), "nothing to capture: pass --signatures or --from-live N");
-    sigs.dedup();
-    let mut kept: std::collections::BTreeMap<String, usize> = Default::default();
-    let mut saved = 0;
-    for sig in sigs {
-        if from_live.is_some() && want.iter().all(|(k, n)| kept.get(*k).copied().unwrap_or(0) >= *n) {
-            break;
-        }
-        let raw = match rpc.get_transaction_raw(&sig).await {
-            Ok(r) => r,
-            Err(e) => {
-                println!("{}…: {}", &sig[..8.min(sig.len())], e);
-                continue;
-            }
-        };
-        if raw.is_null() {
-            continue;
-        }
-        let v = sniper_core::verify::verify_tx(&raw, &sig);
-        if v.items.is_empty() {
-            continue;
-        }
-        if from_live.is_some() {
-            let useful = v.classification.iter().any(|c| kept.get(c.as_str()).copied().unwrap_or(0) < want.get(c.as_str()).copied().unwrap_or(0));
-            if !useful {
-                continue;
-            }
-        }
-        for c in &v.classification {
-            *kept.entry(c.clone()).or_default() += 1;
-        }
-        let doc = serde_json::json!({
-            "provenance": {"source": "getTransaction (jsonParsed)", "captured_at_us": wall_us(), "network": "mainnet-beta",
-                "slot": v.slot, "block_time": v.block_time, "classification": v.classification,
-                "note": "REAL mainnet transaction captured read-only"},
-            "signature": sig,
-            "rpc_result": raw,
-        });
-        std::fs::write(out.join(format!("{sig}.json")), serde_json::to_string_pretty(&doc)?)?;
-        saved += 1;
+    if tally.saved < target {
+        println!("  NOTE: fewer than {target} saved — rerun later (already-captured transactions are skipped), or raise --max-requests / --max-seconds within your plan's limits.");
     }
-    println!("captured {saved} real transactions into {} — by type: {kept:?}", out.display());
-    verify_fixtures(&out, 5)
+    verify_fixtures(&out, &report_dir, EngineConfig::load(std::env::var("SNIPER_CONFIG").ok().map(PathBuf::from).as_deref())?.evidence.min_events_for_mainnet_verified).map(|_| ())
 }
 
-fn verify_fixtures(dir: &std::path::Path, min_events: u64) -> anyhow::Result<()> {
+fn verify_fixtures(dir: &std::path::Path, report_dir: &std::path::Path, min_events: u64) -> anyhow::Result<sniper_core::verify::VerificationSummary> {
     let mut results = Vec::new();
-    let mut files: Vec<_> = std::fs::read_dir(dir).map(|r| r.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json") && !p.ends_with("verification.json")).collect()).unwrap_or_default();
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .map(|r| r.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json") && !p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("verification"))).collect())
+        .unwrap_or_default();
     files.sort();
+    let mut unreadable = 0;
     for f in &files {
-        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(f)?)?;
+        // fixture files are only READ here
+        let Ok(doc) = std::fs::read_to_string(f).map_err(anyhow::Error::from).and_then(|t| Ok(serde_json::from_str::<serde_json::Value>(&t)?)) else {
+            unreadable += 1;
+            continue;
+        };
         if doc["provenance"]["network"] != "mainnet-beta" {
             continue;
         }
         results.push(sniper_core::verify::verify_tx(&doc["rpc_result"], doc["signature"].as_str().unwrap_or("")));
     }
     let summary = sniper_core::verify::summarize(&results, min_events);
-    std::fs::write(dir.join("verification.json"), serde_json::to_string_pretty(&summary)?)?;
-    println!("DECODER VALIDATION against {} real mainnet transactions:", summary.files);
+    std::fs::create_dir_all(report_dir)?;
+    std::fs::write(report_dir.join("verification.json"), serde_json::to_string_pretty(&summary)?)?;
+    std::fs::write(report_dir.join("verification-detail.json"), serde_json::to_string_pretty(&results)?)?;
+    println!("DECODER VERIFICATION — {} captured mainnet transactions in {} (read-only){}", summary.files, dir.display(), if unreadable > 0 { format!(", {unreadable} unreadable files skipped") } else { String::new() });
     if summary.files == 0 {
         println!("  none captured yet — run `./scripts/sniper capture 25` with provider access");
     }
-    for (item, st) in &summary.items {
+    if summary.failed_transactions_skipped + summary.unparsable > 0 {
+        println!("  {} failed-on-chain transactions skipped, {} unparsable", summary.failed_transactions_skipped, summary.unparsable);
+    }
+    for (venue, r) in &summary.venues {
+        if r.status == "disabled" {
+            println!("  {venue:<20} DISABLED ({})", r.reason);
+            continue;
+        }
         println!(
-            "  {:<52} txs {:>3} events {:>4}  hard checks {:>4} ok / {:>2} failed  → {}",
-            item,
-            st.transactions,
-            st.events,
-            st.hard_checks_passed,
-            st.hard_checks_failed,
-            if st.mainnet_verified { "MAINNET VERIFIED" } else if st.hard_checks_failed > 0 { "MISMATCH" } else { "insufficient samples" }
+            "  {venue:<20} {:<22} {} signatures, {} events ({} trades, {} duplicate emissions merged); hard checks {} passed / {} failed / {} inconclusive; trades fully verified {}, with failures {}, inconclusive {}",
+            r.status.to_uppercase(),
+            r.unique_signatures,
+            r.events_decoded,
+            r.trade_events,
+            r.duplicate_emissions_merged,
+            r.checks_passed,
+            r.checks_failed,
+            r.checks_inconclusive,
+            r.events_fully_verified,
+            r.events_with_failures,
+            r.events_inconclusive
         );
+        println!("  {:<20} {}", "", r.reason);
+        if !r.failures_by_check.is_empty() {
+            println!("  {:<20} failed checks: {:?}", "", r.failures_by_check);
+        }
+        if !r.inconclusive_by_check.is_empty() {
+            println!("  {:<20} inconclusive checks: {:?}", "", r.inconclusive_by_check);
+        }
+        if !r.fee_hypotheses.is_empty() {
+            println!("  {:<20} fee routing matched: {:?}", "", r.fee_hypotheses);
+        }
+        for e in r.examples.iter().take(3) {
+            println!("  {:<20} e.g. {}", "", e.chars().take(220).collect::<String>());
+        }
     }
-    for f in summary.failures.iter().take(20) {
-        println!("  FAIL {f}");
-    }
-    println!("venues mainnet-verified for validated P&L: {:?}", summary.venues_mainnet_verified);
-    Ok(())
+    println!(
+        "VENUES MAINNET-VERIFIED (validated P&L allowed): {}",
+        summary.venues_mainnet_verified.iter().map(|(k, v)| format!("{k}={}", if *v { "YES" } else { "no" })).collect::<Vec<_>>().join(", ")
+    );
+    println!("report: {}/verification.json (per-transaction details: verification-detail.json)", report_dir.display());
+    Ok(summary)
 }
 
 async fn doctor(listen_seconds: u64, out: PathBuf) -> anyhow::Result<()> {
-    let ws_urls: Vec<String> = std::env::var("SOLANA_WS_URLS").or_else(|_| std::env::var("SOLANA_WS_URL")).unwrap_or_default().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && !s.contains('<')).collect();
-    let mut rpc_urls: Vec<String> = std::env::var("SOLANA_RPC_URLS").or_else(|_| std::env::var("SOLANA_RPC_URL")).unwrap_or_default().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && !s.contains('<')).collect();
+    use sniper_core::live::endpoint_list;
+    let ws_urls: Vec<String> = endpoint_list(&std::env::var("SOLANA_WS_URLS").or_else(|_| std::env::var("SOLANA_WS_URL")).unwrap_or_default(), &["wss", "ws"]);
+    let mut rpc_urls: Vec<String> = endpoint_list(&std::env::var("SOLANA_RPC_URLS").or_else(|_| std::env::var("SOLANA_RPC_URL")).unwrap_or_default(), &["https", "http"]);
     if rpc_urls.is_empty() {
         rpc_urls = ws_urls.iter().filter_map(|u| sniper_core::live::ws_to_http(u)).collect();
     }
     println!("probing {} WebSocket and {} RPC endpoint(s) (read-only, {listen_seconds}s listen)…", ws_urls.len(), rpc_urls.len());
     let ws = futures_util::future::join_all(ws_urls.iter().map(|u| sniper_core::doctor::probe_ws(u, Duration::from_secs(listen_seconds)))).await;
     let rpc = futures_util::future::join_all(rpc_urls.iter().map(|u| sniper_core::doctor::probe_rpc(u))).await;
-    let jup = sniper_core::doctor::probe_jupiter(std::env::var("JUPITER_QUOTE_URL").ok().filter(|u| !u.contains('<')).as_deref(), std::env::var("JUPITER_API_KEY").ok().filter(|s| !s.is_empty())).await;
+    let jup = sniper_core::doctor::probe_jupiter(endpoint_list(&std::env::var("JUPITER_QUOTE_URL").unwrap_or_default(), &["https", "http"]).first().map(|s| s.as_str()), std::env::var("JUPITER_API_KEY").ok().filter(|s| !s.is_empty())).await;
     let rep = sniper_core::doctor::assess(ws, rpc, jup);
     std::fs::create_dir_all(&out)?;
     let path = out.join(format!("doctor-{}.json", wall_us() / 1_000_000));
@@ -670,7 +921,11 @@ async fn doctor(listen_seconds: u64, out: PathBuf) -> anyhow::Result<()> {
     for r in &rep.rpc {
         println!("RPC {}  ok={} getSlot={:?}ms pump events decoded={} pumpswap events decoded={} {}", r.host, r.ok, r.get_slot_ms.map(|x| x.round()), r.pump_events_decoded, r.pumpswap_events_decoded, r.error.as_ref().map(|e| sniper_core::doctor::scrub(e, &secrets)).unwrap_or_default());
     }
-    println!("JUP configured={} ok={} {}", rep.jupiter.configured, rep.jupiter.ok, rep.jupiter.error.clone().unwrap_or_default());
+    if rep.jupiter.configured {
+        println!("JUP configured ok={} {}", rep.jupiter.ok, rep.jupiter.error.clone().unwrap_or_default());
+    } else {
+        println!("JUP not configured (JUPITER_QUOTE_URL empty; optional)");
+    }
     println!("PumpSwap coverage: {}", rep.pumpswap_coverage);
     println!("recommended SOLANA_STREAM_KIND: {}", rep.recommended_stream_kind.clone().unwrap_or("-".into()));
     for p in &rep.problems {

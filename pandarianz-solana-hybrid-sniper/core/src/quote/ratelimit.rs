@@ -27,6 +27,22 @@ impl TokenBucket {
             Err(RateLimitReason::LocalBudget)
         }
     }
+    /// Microseconds until `try_acquire` can next succeed (0 = now), including any remote cooldown.
+    pub fn wait_us(&self, now_us: i64) -> i64 {
+        if now_us < self.cooldown_until_us {
+            return self.cooldown_until_us - now_us;
+        }
+        let dt = (now_us - self.last_us).max(0) as f64 / 1e6;
+        let tokens = (self.tokens + dt * self.rate_per_s).min(self.burst);
+        if tokens >= 1.0 || self.rate_per_s <= 0.0 {
+            0
+        } else {
+            ((1.0 - tokens) / self.rate_per_s * 1e6).ceil() as i64
+        }
+    }
+    pub fn cooldown_until_us(&self) -> i64 {
+        self.cooldown_until_us
+    }
     pub fn cooldown(&mut self, now_us: i64, ms: u64) {
         self.cooldown_until_us = self.cooldown_until_us.max(now_us + ms as i64 * 1000);
     }

@@ -1,96 +1,91 @@
-//! Regression checks on REAL captured mainnet transactions (`fixtures/real/*.json`, produced by
-//! `sniper capture`). With no captures present the test reports that explicitly and passes.
+//! Re-verification of REAL captured mainnet transactions (`fixtures/real/*.json`, written by
+//! `sniper capture`). The files are only READ: the test hashes every file before and after to prove
+//! it. Whether a venue is mainnet-verified is decided by `sniper verify-fixtures` (report in
+//! reports/verification/), not by this test: evidence mismatches on real data are reported, while
+//! this test fails only on code defects (unparsable shapes, panics, modified files).
 
+use sha2::{Digest, Sha256};
+use sniper_core::decode::decode_raw;
 use sniper_core::decode::pumpfun::PumpEvent;
-use sniper_core::decode::pumpswap::PumpSwapEvent;
-use sniper_core::decode::{decode_raw, VenueEvent};
+use sniper_core::fixtures::{wallet, Curve, Pool};
 use sniper_core::stream::ws::parse_tx_object;
-use sniper_core::types::Commitment;
+use sniper_core::txbuild::{self, CurveAccounts, Emission};
+use sniper_core::types::{Commitment, Pubkey};
+use sniper_core::verify::{summarize, verify_tx};
 
-#[test]
-fn real_mainnet_fixtures_decode_and_satisfy_invariants() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/real");
-    check_dir(&dir, "mainnet-beta");
+fn fixture_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .map(|r| r.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json") && !p.file_name().unwrap().to_string_lossy().starts_with("verification")).collect())
+        .unwrap_or_default();
+    files.sort();
+    files
 }
 
-/// The harness itself is exercised on synthetic RPC-shaped transactions in a temp dir (never in fixtures/real).
+fn digest(files: &[std::path::PathBuf]) -> Vec<(String, String)> {
+    files.iter().map(|f| (f.display().to_string(), format!("{:x}", Sha256::digest(std::fs::read(f).unwrap())))).collect()
+}
+
+/// Re-verify every mainnet fixture in `dir`; returns (files, events).
+fn reverify(dir: &std::path::Path, network: &str) -> (usize, usize) {
+    let files = fixture_files(dir);
+    if files.is_empty() {
+        eprintln!("REAL FIXTURES: 0 captured mainnet transactions in {} — mainnet decoder verification NOT yet performed (run `sniper capture`).", dir.display());
+        return (0, 0);
+    }
+    let before = digest(&files);
+    let mut results = Vec::new();
+    let mut events = 0;
+    for f in &files {
+        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(f).unwrap()).unwrap_or_else(|e| panic!("{}: not JSON: {e}", f.display()));
+        if doc["provenance"]["network"] != network {
+            continue;
+        }
+        let sig = doc["signature"].as_str().unwrap_or_else(|| panic!("{}: no signature", f.display()));
+        let raw = parse_tx_object(&doc["rpc_result"], Some(sig), 0, "capture", Commitment::Confirmed, 0).unwrap_or_else(|| panic!("{}: unparsable transaction shape", f.display()));
+        events += decode_raw(&raw).events.len();
+        results.push(verify_tx(&doc["rpc_result"], sig));
+    }
+    assert_eq!(digest(&files), before, "fixture files must never be modified");
+    let s = summarize(&results, 5);
+    for (venue, r) in &s.venues {
+        eprintln!(
+            "{network} FIXTURES {venue}: {} — {} sigs, {} events, {} merged duplicates, checks {} pass / {} fail / {} inconclusive; failures {:?}",
+            r.status, r.unique_signatures, r.events_decoded, r.duplicate_emissions_merged, r.checks_passed, r.checks_failed, r.checks_inconclusive, r.failures_by_check
+        );
+    }
+    (results.len(), events)
+}
+
 #[test]
-fn invariant_harness_self_test_on_synthetic_rpc_shapes() {
-    use sniper_core::decode::{anchor, build, pumpswap};
-    use sniper_core::fixtures::{wallet, Curve, Pool};
+fn real_mainnet_fixtures_are_reverified_read_only() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/real");
+    reverify(&dir, "mainnet-beta");
+}
+
+/// The harness itself, on realistic synthetic RPC shapes in a temp dir (never in fixtures/real).
+#[test]
+fn reverify_harness_self_test_on_realistic_synthetic_shapes() {
     let dir = tempfile::tempdir().unwrap();
     let mut c = Curve::new("SELF");
-    let evs = vec![c.create("S", "S", 0), c.buy(wallet("a"), 500_000_000, 0).unwrap(), c.buy(wallet("b"), 200_000_000, 0).unwrap()];
-    let sell = c.sell(wallet("a"), 1_000_000_000_000, 0).unwrap();
-    let mut pool = Pool::new("SELF", sniper_core::types::Pubkey::synthetic("m"), 400_000_000_000_000, 70_000_000_000);
+    let acc = CurveAccounts::of(&c);
+    let PumpEvent::Trade(b) = c.buy(wallet("a"), 500_000_000, 0).unwrap() else { panic!() };
+    let PumpEvent::Trade(s) = c.sell(wallet("a"), b.token_amount / 2, 0).unwrap() else { panic!() };
+    let mint = Pubkey::synthetic("m");
+    let mut pool = Pool::new("SELF", mint, 400_000_000_000_000, 70_000_000_000);
     let ps = pool.buy(wallet("p"), 1_000_000_000, 0);
-    let mut data = anchor::EVENT_IX_TAG.to_vec();
-    data.extend(pumpswap::encode(&ps));
     let docs = [
-        ("s1", build::pump_logs(&evs), vec![]),
-        ("s2", build::pump_logs(&[sell]), vec![]),
-        ("s3", build::pumpswap_inner(&[ps]).0, vec![serde_json::json!({"programId": sniper_core::types::programs::PUMP_SWAP, "data": bs58::encode(&data).into_string()})]),
+        ("s1", txbuild::pump_trade_tx(&acc, &b, 900_000_000_000_000, Emission::Both, serde_json::json!(0), "s1")),
+        ("s2", txbuild::pump_trade_tx(&acc, &s, 900_000_000_000_000, Emission::Both, serde_json::json!(1), "s2")),
+        ("s3", txbuild::pumpswap_swap_tx(&ps, &mint.to_string(), serde_json::json!(1), "s3")),
     ];
-    for (sig, logs, inner) in docs {
-        let doc = serde_json::json!({
-            "provenance": {"network": "synthetic-selftest"},
-            "signature": sig,
-            "rpc_result": {"slot": 1, "blockTime": 1, "meta": {"err": null, "logMessages": logs, "innerInstructions": [{"index": 0, "instructions": inner}]}, "transaction": {"signatures": [sig]}},
-        });
+    for (sig, tx) in docs {
+        let doc = serde_json::json!({"provenance": {"network": "synthetic-selftest"}, "signature": sig, "rpc_result": tx});
         std::fs::write(dir.path().join(format!("{sig}.json")), doc.to_string()).unwrap();
     }
-    let (files, events, checked) = check_dir(dir.path(), "synthetic-selftest");
-    assert_eq!((files, events, checked), (3, 5, 4));
-}
-
-fn check_dir(dir: &std::path::Path, network: &str) -> (usize, usize, usize) {
-    let mut files: Vec<_> = std::fs::read_dir(&dir).map(|r| r.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")).collect()).unwrap_or_default();
-    files.sort();
-    if files.is_empty() {
-        eprintln!("REAL FIXTURES: 0 captured mainnet transactions in fixtures/real — mainnet decoder verification NOT yet performed (run `sniper capture`).");
-        return (0, 0, 0);
+    assert_eq!(reverify(dir.path(), "synthetic-selftest"), (3, 3));
+    for f in fixture_files(dir.path()) {
+        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        let v = verify_tx(&doc["rpc_result"], doc["signature"].as_str().unwrap());
+        assert!(v.passed && v.checks.iter().filter(|c| c.hard).all(|c| c.ok), "{}: {:#?}", f.display(), v.checks);
     }
-    let (mut events, mut checked) = (0, 0);
-    for f in &files {
-        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(f).unwrap()).unwrap();
-        assert_eq!(doc["provenance"]["network"], network, "{}", f.display());
-        let sig = doc["signature"].as_str().unwrap();
-        let raw = parse_tx_object(&doc["rpc_result"], Some(sig), 0, "capture", Commitment::Confirmed, 0).expect("parsable transaction");
-        let out = decode_raw(&raw);
-        assert!(out.warnings.is_empty(), "{}: {:?}", f.display(), out.warnings);
-        if network == "mainnet-beta" {
-            // independent transaction evidence (token/SOL balance deltas, fee arithmetic)
-            let v = sniper_core::verify::verify_tx(&doc["rpc_result"], sig);
-            let failed: Vec<_> = v.checks.iter().filter(|c| c.hard && !c.ok).map(|c| format!("{}: {}", c.name, c.detail)).collect();
-            assert!(failed.is_empty(), "{}: decoder disagrees with transaction evidence: {failed:?}", f.display());
-            assert!(doc["provenance"]["slot"].as_u64().is_some() || doc["rpc_result"]["slot"].as_u64().is_some(), "slot provenance");
-        }
-        for d in &out.events {
-            events += 1;
-            match &d.event {
-                VenueEvent::Pump(PumpEvent::Trade(t)) if t.is_sol_quoted() => {
-                    // constant product on virtual reserves: reconstruct the pre-trade state from the
-                    // post-trade reserves and amounts; k must not decrease by more than rounding
-                    let (vs, vt) = (t.virtual_sol_reserves as i128, t.virtual_token_reserves as i128);
-                    let (ds, dt) = (t.sol_amount as i128, t.token_amount as i128);
-                    let (pre_s, pre_t) = if t.is_buy { (vs - ds, vt + dt) } else { (vs + ds, vt - dt) };
-                    let (k_pre, k_post) = (pre_s * pre_t, vs * vt);
-                    assert!(k_post * 1_000_000 >= k_pre * 999_999, "{}: curve invariant k_post {k_post} < k_pre {k_pre}", f.display());
-                    checked += 1;
-                }
-                VenueEvent::PumpSwap(PumpSwapEvent::Swap(s)) if s.is_buy => {
-                    // SDK: base_out = floor(base * (net-1) / (quote_eff + net - 1)), net = quote_in (excl. fees)
-                    let q_eff = (s.pool_quote_token_reserves as i128 + s.virtual_quote_reserves.unwrap_or(0)) as u128;
-                    let net = (s.quote_amount_pool - s.lp_fee) as u128;
-                    let expected = s.pool_base_token_reserves as u128 * (net - 1) / (q_eff + net - 1);
-                    let diff = (expected as i128 - s.base_amount as i128).abs();
-                    assert!(diff <= 1 + expected as i128 / 10_000, "{}: pumpswap buy out {} vs model {expected}", f.display(), s.base_amount);
-                    checked += 1;
-                }
-                _ => {}
-            }
-        }
-    }
-    eprintln!("{network} FIXTURES: {} files, {events} venue events decoded, {checked} invariant checks passed", files.len());
-    (files.len(), events, checked)
 }

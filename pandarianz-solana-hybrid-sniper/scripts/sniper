@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # One-command local workflow (macOS / Linux, bash 3.2 compatible). PAPER ONLY.
-#   ./scripts/sniper check                      ← one command: environment, tests, providers, decoders, next action
-#   ./scripts/sniper setup | env-check | doctor [SECS] | capture [N] | verify-decoders | verify-live [SECS]
+#   ./scripts/sniper check [--capture N] [--max-requests R] [--max-seconds S] [--rate RPS]
+#        ← one command: PAPER-only safety, regression tests, re-verification of existing captures,
+#          provider diagnostics, optional bounded mainnet capture, final verification report
+#   ./scripts/sniper setup | env-check | endpoints | doctor [SECS] | capture [N] [R] [S] [RPS] | verify-decoders | verify-live [SECS]
 #                    | start [fixture|live] [--profile NAME] | restart | stop [--db] | status | report [PROFILE_KEY]
 #                    | calibrate [PROFILE_KEY] | replay PROFILE_KEY | test | logs | db-up | db-down
 set -euo pipefail
@@ -35,10 +37,14 @@ db_up() {
   (cd "$ROOT" && docker compose up -d --wait postgres) || die "docker compose failed"
 }
 
+# Always (re)build: a no-op when up to date, and it guarantees the binary matches the checked-out code
+# (a stale binary from an older version would lack newer commands).
 build() {
   need cargo "install Rust via https://rustup.rs"
-  say "building engine (release)"
+  [ -n "${SNIPER_BUILT:-}" ] && return 0
+  say "building engine (release; no-op when up to date)"
   (cd "$CORE" && cargo build --release --quiet)
+  SNIPER_BUILT=1
 }
 
 dash_deps() {
@@ -80,7 +86,7 @@ cmd_start() {
     die "LIVE mode needs SOLANA_WS_URLS in .env (provider WebSocket URL[s]). Use 'start fixture' for the offline replay."
   fi
   case "${SOLANA_WS_URLS:-}" in *"<"*) [ "$mode" = live ] && die "SOLANA_WS_URLS still contains the .env.example placeholder" ;; esac
-  [ -x "$BIN" ] || build
+  build
   db_up
   [ -n "$profile" ] || profile="$( [ "$mode" = live ] && echo main || echo "run$(date +%s)")"
   local key; key="$( [ "$mode" = live ] && echo "LIVE:$profile" || echo "FIXTURE:$profile")"
@@ -151,33 +157,40 @@ cmd_report() {
   local key="${1:-}"
   [ -n "$key" ] || key="$(cat "$RUN/profile" 2>/dev/null || true)"
   [ -n "$key" ] || die "usage: report PROFILE_KEY (e.g. FIXTURE:run123 or LIVE:main)"
-  [ -x "$BIN" ] || build
+  build
   (cd "$CORE" && "$BIN" report --profile "$key")
 }
 
 cmd_replay() {
   [ -n "${1:-}" ] || die "usage: replay PROFILE_KEY"
-  [ -x "$BIN" ] || build
+  build
   (cd "$CORE" && "$BIN" replay --from-profile "$1")
 }
 
 cmd_verify_live() {
   [ -n "${SOLANA_WS_URLS:-}${SOLANA_WS_URL:-}" ] || die "verify-live needs SOLANA_WS_URLS in .env"
-  [ -x "$BIN" ] || build
+  build
   local secs="${1:-120}"
   say "connecting to live providers for ${secs}s (read-only, memory store) …"
   (cd "$CORE" && "$BIN" verify-live --seconds "$secs" --out "$ROOT/reports")
 }
 
+# capture N [MAX_REQUESTS] [MAX_SECONDS] [RATE] — bounded, never overwrites existing fixtures
 cmd_capture() {
-  [ -x "$BIN" ] || build
-  (cd "$CORE" && "$BIN" capture --from-live "${1:-25}" --out "$ROOT/fixtures/real")
-  (cd "$CORE" && cargo test --quiet --test real_fixtures -- --nocapture 2>&1 | grep -E "FIXTURES|test result")
+  build
+  local n="${1:-25}" req="${2:-150}" secs="${3:-300}" rate="${4:-2}"
+  (cd "$CORE" && "$BIN" capture --from-live "$n" --max-requests "$req" --max-seconds "$secs" --rate "$rate" \
+      --out "$ROOT/fixtures/real" --report-dir "$ROOT/reports/verification")
 }
 
+# true only when at least one USABLE WebSocket endpoint is configured (empty / placeholder values
+# do not count). Uses the engine's own parser when built; conservative shell fallback otherwise.
 has_live_urls() {
+  if [ -n "${SNIPER_BUILT:-}" ]; then (cd "$CORE" && "$BIN" endpoints >/dev/null 2>&1); return $?; fi
   local u="${SOLANA_WS_URLS:-}${SOLANA_WS_URL:-}"
-  [ -n "$u" ] && case "$u" in *"<"*) return 1 ;; *) return 0 ;; esac
+  u="$(printf '%s' "$u" | tr -d ' ,')"
+  [ -n "$u" ] || return 1
+  case "$u" in *"<"*|*">"*) return 1 ;; ws://*|wss://*) return 0 ;; *) return 1 ;; esac
 }
 
 # Environment & dependency verification. Prints OK/MISSING lines; returns non-zero on blockers.
@@ -190,21 +203,23 @@ cmd_env_check() {
   chk docker "Docker Desktop (or set DATABASE_URL to an existing PostgreSQL 14+)" opt
   chk git "xcode-select --install"
   if [ -f "$ROOT/.env" ]; then say "OK      .env present (values are never printed)"; else say "MISSING .env — run ./scripts/sniper setup (creates it from .env.example)"; fail=1; fi
-  if has_live_urls; then say "OK      SOLANA_WS_URLS configured"; else say "INFO    SOLANA_WS_URLS not configured → live checks will be skipped"; fi
+  if [ -n "${SNIPER_BUILT:-}" ]; then
+    (cd "$CORE" && "$BIN" endpoints) | while IFS= read -r l; do say "        $l"; done || true
+  elif has_live_urls; then say "OK      SOLANA_WS_URLS has a usable wss:// endpoint"; else say "INFO    SOLANA_WS_URLS NOT CONFIGURED (empty or placeholder) → live checks will be skipped"; fi
   if db_reachable; then say "OK      PostgreSQL reachable"; else say "INFO    PostgreSQL not reachable yet (start: ./scripts/sniper db-up)"; fi
   return $fail
 }
 
 cmd_doctor() {
-  [ -x "$BIN" ] || build
+  build
   has_live_urls || { say "SOLANA_WS_URLS not configured in .env — nothing to probe"; return 2; }
   (cd "$CORE" && "$BIN" doctor --listen-seconds "${1:-20}" --out "$ROOT/reports")
 }
 
+# Re-verify the existing captured transactions (files are only read; reports → reports/verification/)
 cmd_verify_decoders() {
-  [ -x "$BIN" ] || build
-  (cd "$CORE" && "$BIN" verify-fixtures --dir "$ROOT/fixtures/real")
-  (cd "$CORE" && cargo test --quiet --test real_fixtures --test idl_verification 2>&1 | grep -E "FIXTURES|test result")
+  build
+  (cd "$CORE" && "$BIN" verify-fixtures --dir "$ROOT/fixtures/real" --report-dir "$ROOT/reports/verification")
 }
 
 cmd_restart() {
@@ -215,41 +230,76 @@ cmd_restart() {
   cmd_start "$mode" --profile "$profile"
 }
 
-# One command: environment → tests → providers → real-transaction capture/verification → next action.
+# One command: safety → tests → re-verify existing captures → providers → optional bounded capture
+# → final verification report → next action. Never trades, signs or sends anything.
 cmd_check() {
-  local next=""
-  say "== 1/5 environment"
+  local cap=0 req=150 secs=300 rate=2 next="" verdict
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --capture) shift; cap="${1:-25}" ;;
+      --max-requests) shift; req="${1:-150}" ;;
+      --max-seconds) shift; secs="${1:-300}" ;;
+      --rate) shift; rate="${1:-2}" ;;
+      *) die "unknown check option: $1 (use --capture N --max-requests R --max-seconds S --rate RPS)" ;;
+    esac
+    shift
+  done
+  mkdir -p "$ROOT/reports/verification"
+  say "== 1/7 environment"
   cmd_env_check || next="Install the missing dependencies listed above, then rerun ./scripts/sniper check"
   [ -f "$ROOT/.env" ] || { cp "$ROOT/.env.example" "$ROOT/.env"; say "created .env from template"; }
+  [ -z "$next" ] && build
   if [ -z "$next" ]; then
-    say "== 2/5 build + automated tests"
-    build
+    say "== 2/7 PAPER-only static safety"
+    if "$ROOT/scripts/check_no_live.sh" > "$RUN/safety.log" 2>&1; then say "OK      no signing / broadcasting / live-order code paths"; else cat "$RUN/safety.log"; next="Safety check FAILED — do not run anything; see .run/safety.log"; fi
+  fi
+  if [ -z "$next" ]; then
+    say "== 3/7 full regression tests"
     db_up >/dev/null 2>&1 || say "PostgreSQL unavailable — the PostgreSQL integration test will be skipped"
-    if (cd "$CORE" && cargo test --quiet 2>&1 | tee "$RUN/test.log" | grep -E "test result" | awk '{p+=$4; f+=$6} END {printf "[sniper] tests: %d passed, %d failed\n", p, f; exit (f>0)}'); then :; else next="Tests failed — see .run/test.log"; fi
-    "$ROOT/scripts/check_no_live.sh" >/dev/null && say "PAPER-only static safety check: OK" || next="Safety check failed — do not run"
+    if (cd "$CORE" && cargo test --quiet 2>&1 | tee "$RUN/test.log" | grep -E "test result" | awk '{p+=$4; f+=$6} END {printf "[sniper] tests: %d passed, %d failed\n", p, f; exit (f>0)}'); then :; else
+      grep -E "^test .*FAILED|panicked" "$RUN/test.log" | head -10
+      next="Tests failed — see .run/test.log"
+    fi
   fi
   if [ -z "$next" ]; then
-    say "== 3/5 provider connectivity"
+    say "== 4/7 re-verify existing captured transactions (read-only)"
+    cmd_verify_decoders | tee "$RUN/verify-existing.log" | sed -n '1,40p'
+  fi
+  local providers=0
+  if [ -z "$next" ]; then
+    say "== 5/7 provider diagnostics"
+    (cd "$CORE" && "$BIN" endpoints) | while IFS= read -r l; do say "        $l"; done || true
     if has_live_urls; then
+      providers=1
       cmd_doctor 15 | tee "$RUN/doctor.log" | grep -E "^(WS|RPC|JUP|PumpSwap|recommended|PROBLEM|READY|NEXT)|REJECTED|accepted" || true
-      grep -q "READY FOR LIVE: true" "$RUN/doctor.log" || next="$(grep '^NEXT:' "$RUN/doctor.log" | sed 's/^NEXT: //')"
     else
-      next="Add your provider WebSocket URL(s) to $ROOT/.env as SOLANA_WS_URLS=wss://… (keys stay local), then rerun ./scripts/sniper check"
+      say "no usable provider endpoint — provider checks and capture skipped"
     fi
   fi
-  if [ -z "$next" ]; then
-    say "== 4/5 real mainnet transaction capture + decoder validation"
-    cmd_capture 10 || true
-    cmd_verify_decoders || true
-    if grep -q '"pump_bonding_curve": true' "$ROOT/fixtures/real/verification.json" 2>/dev/null; then
-      say "mainnet decoder verification: Pump.fun curve VERIFIED"
+  if [ -z "$next" ] && [ "$cap" -gt 0 ] 2>/dev/null; then
+    say "== 6/7 bounded mainnet capture: target $cap new transactions, ≤$req requests, ≤${secs}s, $rate req/s"
+    if [ "$providers" = 1 ]; then
+      cmd_capture "$cap" "$req" "$secs" "$rate" 2>&1 | tee "$RUN/capture.log" | grep -E "^(CAPTURE|  )" | sed -n '1,12p' || true
     else
-      next="Decoder verification incomplete — inspect fixtures/real/verification.json (FAIL lines above) before trusting live results"
+      say "skipped: no usable provider endpoint"
     fi
+  elif [ -z "$next" ]; then
+    say "== 6/7 mainnet capture skipped (add --capture 25 to collect new transactions; existing ones were re-verified)"
   fi
-  say "== 5/5 summary"
   if [ -z "$next" ]; then
-    next="Run: ./scripts/sniper start live --profile main   (dashboard http://127.0.0.1:3000), then ./scripts/sniper report LIVE:main after several days"
+    say "== 7/7 final verification report"
+    cmd_verify_decoders > "$RUN/verify-final.log" 2>&1 || true
+    grep -E "^(DECODER|  [a-z_]+ +[A-Z_]+|VENUES|report:)" "$RUN/verify-final.log" || cat "$RUN/verify-final.log"
+    verdict="$(grep '^VENUES MAINNET-VERIFIED' "$RUN/verify-final.log" || true)"
+    case "$verdict" in
+      *"pump_bonding_curve=YES"*"pumpswap=YES"*) next="Both venues mainnet-verified. Run: ./scripts/sniper start live --profile main (dashboard http://127.0.0.1:3000; PAPER only)" ;;
+      *"YES"*) next="Only some venues are mainnet-verified (see above): fills on the others stay UNVERIFIED. Inspect reports/verification/verification-detail.json for the remaining failures, or capture more with: ./scripts/sniper check --capture 25" ;;
+      *) if [ "$providers" = 1 ]; then
+           next="No venue is mainnet-verified yet. Read the failed/inconclusive checks above (details: reports/verification/verification-detail.json); collect more evidence with: ./scripts/sniper check --capture 25 --max-requests 150 --max-seconds 300"
+         else
+           next="Add your provider URLs to $ROOT/.env (SOLANA_WS_URLS=wss://…, optional SOLANA_RPC_URLS=https://…), then: ./scripts/sniper check --capture 25"
+         fi ;;
+    esac
   fi
   printf '\n\033[1mNEXT REQUIRED ACTION:\033[0m %s\n' "$next"
 }
@@ -263,12 +313,13 @@ case "${1:-help}" in
   report) shift; cmd_report "$@" ;;
   replay) shift; cmd_replay "$@" ;;
   verify-live) shift; cmd_verify_live "$@" ;;
-  check) cmd_check ;;
+  check) shift; cmd_check "$@" ;;
+  endpoints) build; (cd "$CORE" && "$BIN" endpoints) ;;
   env-check) cmd_env_check ;;
   doctor) shift; cmd_doctor "$@" ;;
   verify-decoders) cmd_verify_decoders ;;
   restart) cmd_restart ;;
-  calibrate) shift; [ -x "$BIN" ] || build; (cd "$CORE" && "$BIN" calibrate --profile "${1:-LIVE:main}") ;;
+  calibrate) shift; build; (cd "$CORE" && "$BIN" calibrate --profile "${1:-LIVE:main}") ;;
   capture) shift; cmd_capture "$@" ;;
   logs) tail -n 100 -f "$RUN/engine.log" ;;
   db-up) db_up ;;

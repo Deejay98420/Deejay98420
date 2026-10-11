@@ -255,7 +255,7 @@ pub struct Engine {
     pool_reqs: HashSet<Pubkey>,
     mint_reqs: HashSet<Pubkey>,
     pub stats: EngineCounters,
-    /// real-transaction decoder verification (fixtures/real/verification.json)
+    /// real-transaction decoder verification (reports/verification/verification.json)
     pub decoder_verification: Option<crate::verify::VerificationSummary>,
     /// stop the run loop when a finite source ends (fixture/replay without --hold)
     pub exit_on_end: bool,
@@ -590,7 +590,7 @@ impl Engine {
             self.store.send(StoreCmd::RawEvent { run_id: self.run_id.clone(), ev: Box::new(raw.clone()) }).await;
             let out = decode_raw(&raw);
             if !out.tx_failed {
-                for Decoded { index, event } in out.events {
+                for Decoded { index, event, .. } in out.events {
                     self.health.decoded_events += 1;
                     self.universe.apply(Input { slot: raw.slot, signature: raw.signature.clone(), index, ts_us: raw.recv_us, event });
                 }
@@ -628,7 +628,7 @@ impl Engine {
         }
         let mut stamps = Stamps { block_time_us: raw.block_time.map(|b| b * 1_000_000), event_ts_us: None, recv_us: raw.recv_us, decoded_us: Some(raw.recv_us + decode_us) };
         let mut touched: Vec<(Pubkey, Applied)> = Vec::new();
-        for Decoded { index, event } in out.events {
+        for Decoded { index, event, .. } in out.events {
             self.health.decoded_events += 1;
             if stamps.event_ts_us.is_none() {
                 stamps.event_ts_us = event.timestamp().map(|t| t * 1_000_000);

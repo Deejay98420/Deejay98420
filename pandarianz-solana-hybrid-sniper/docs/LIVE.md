@@ -56,13 +56,15 @@ The verdict must show `"live_validated": true`, decoded venue events > 0, zero d
 ## 4. Verify the decoders against real mainnet transactions
 
 ```bash
-./scripts/sniper capture 25           # diverse sample → fixtures/real/*.json (signature + slot provenance)
-./scripts/sniper verify-decoders      # transaction-evidence checks → fixtures/real/verification.json
+./scripts/sniper check --capture 25 --max-requests 150 --max-seconds 300   # everything, bounded
+# or step by step:
+./scripts/sniper capture 25 150 300 2  # N new txs, ≤150 requests, ≤300 s, 2 req/s → fixtures/real/*.json
+./scripts/sniper verify-decoders       # read-only re-verification → reports/verification/verification.json
 ```
 
-Every `MISMATCH` line must be understood before live results are trusted. Fills on venues without `MAINNET VERIFIED` are marked unverified and never count as validated P&L.
+`capture` never modifies or replaces an existing file, skips transactions already captured, and stops at the target, the request budget or the time limit, saying which. On a free RPC plan keep `--rate` at 2–5; 429 responses are retried after `Retry-After` and counted, never printed one by one.
 
-Commit `fixtures/real/` afterwards. These files are permanent regression fixtures.
+The report has one line per venue: `MAINNET_VERIFIED`, `MISMATCH` (a hard check failed — read `failed checks` and the examples; details per transaction in `verification-detail.json`) or `INSUFFICIENT_EVIDENCE` (too few trades passed every check, or checks were inconclusive). Fills on venues that are not mainnet-verified are marked unverified and never count as validated P&L.
 
 ## 5. Run live-data PAPER trading
 

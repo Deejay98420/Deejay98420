@@ -123,7 +123,7 @@ pub async fn probe_ws(url: &str, listen: Duration) -> WsProbe {
     let reqs = [
         json!({"jsonrpc":"2.0","id":1,"method":"logsSubscribe","params":[{"mentions":[programs::PUMP_FUN]},{"commitment":"confirmed"}]}),
         json!({"jsonrpc":"2.0","id":2,"method":"logsSubscribe","params":[{"mentions":[programs::PUMP_SWAP]},{"commitment":"confirmed"}]}),
-        json!({"jsonrpc":"2.0","id":3,"method":"transactionSubscribe","params":[{"accountInclude":[programs::PUMP_FUN, programs::PUMP_SWAP],"failed":false,"vote":false},{"commitment":"confirmed","encoding":"jsonParsed","transactionDetails":"full","maxSupportedTransactionVersion":0}]}),
+        json!({"jsonrpc":"2.0","id":3,"method":"transactionSubscribe","params":[{"accountInclude":[programs::PUMP_FUN, programs::PUMP_SWAP],"failed":false,"vote":false},{"commitment":"confirmed","encoding":"jsonParsed","transactionDetails":"full","maxSupportedTransactionVersion":crate::rpc::max_tx_version()}]}),
         json!({"jsonrpc":"2.0","id":900,"method":"slotSubscribe"}),
         json!({"jsonrpc":"2.0","id":901,"method":"slotsUpdatesSubscribe"}),
     ];

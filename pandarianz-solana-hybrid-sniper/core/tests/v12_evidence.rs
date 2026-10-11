@@ -11,113 +11,140 @@ use sniper_core::decode::{anchor, build, pumpswap};
 use sniper_core::fixtures::{hybrid_session, wallet, Curve, Pool};
 use sniper_core::store::MemData;
 use sniper_core::stream::{ws, ConnState, Ingestor, StreamMsg};
-use sniper_core::types::{programs, Commitment, DataMode, Pubkey, WSOL_MINT};
-use sniper_core::verify::{summarize, verify_tx};
+use sniper_core::types::{programs, Commitment, DataMode, Pubkey};
+use sniper_core::txbuild::{self, Emission};
+use sniper_core::verify::{summarize, verify_tx, Outcome};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
 
 const S: i64 = 1_000_000;
 
-fn tb(owner: &str, mint: &str, amount: i128, idx: usize) -> Value {
-    json!({"accountIndex": idx, "owner": owner, "mint": mint, "uiTokenAmount": {"amount": amount.to_string(), "decimals": 6}})
-}
-
-/// Build a getTransaction-shaped curve trade with consistent balance evidence.
-fn curve_trade_tx(tamper_event: bool, tamper_balance: bool) -> (Value, String) {
+/// Realistic synthetic curve trade transactions (instruction tree, parsed transfers, log+CPI events).
+fn curve_trades(n_buys: usize, n_sells: usize) -> Vec<(Value, String)> {
     let mut c = Curve::new("EVID");
-    let user = wallet("evid-user");
-    let PumpEvent::Trade(mut t) = c.buy(user, 300_000_000, 0).unwrap() else { panic!() };
-    let real_tokens = t.token_amount as i128;
-    if tamper_event {
-        t.token_amount += 1; // decoder output no longer matches chain evidence
+    let acc = txbuild::CurveAccounts::of(&c);
+    let mut out = Vec::new();
+    let mut held = Vec::new();
+    for i in 0..n_buys.max(n_sells) {
+        let user = wallet(&format!("evid-user-{i}"));
+        let PumpEvent::Trade(t) = c.buy(user, 300_000_000, i as i64 * S).unwrap() else { panic!() };
+        held.push((user, t.token_amount));
+        if i < n_buys {
+            let sig = format!("evid-buy-{i}");
+            out.push((txbuild::pump_trade_tx(&acc, &t, 900_000_000_000_000, Emission::Both, json!(0), &sig), sig));
+        }
     }
-    let user_s = user.to_string();
-    let curve_s = c.bonding_curve.to_string();
-    let mint_s = c.mint.to_string();
-    let got = if tamper_balance { real_tokens - 5 } else { real_tokens };
-    let paid = t.sol_amount as i64 + t.fee.unwrap() as i64 + t.creator_fee.unwrap() as i64 + 5_000;
-    let sig = "evid-sig-1".to_string();
-    let tx = json!({
-        "slot": 123, "blockTime": 1_760_000_000,
-        "meta": {
-            "err": null, "fee": 5000,
-            "logMessages": build::pump_logs(&[PumpEvent::Trade(t)]),
-            "innerInstructions": [],
-            "preBalances": [10_000_000_000i64, 1], "postBalances": [10_000_000_000i64 - paid, 1],
-            "preTokenBalances": [tb(&curve_s, &mint_s, 793_100_000_000_000, 1)],
-            "postTokenBalances": [tb(&curve_s, &mint_s, 793_100_000_000_000 - got, 1), tb(&user_s, &mint_s, got, 2)],
-        },
-        "transaction": {"signatures": [sig.clone()], "message": {"accountKeys": [{"pubkey": user_s}, {"pubkey": curve_s}]}}
-    });
-    (tx, sig)
+    for (i, (user, tokens)) in held.into_iter().take(n_sells).enumerate() {
+        let PumpEvent::Trade(t) = c.sell(user, tokens / 2, 100 * S).unwrap() else { panic!() };
+        let sig = format!("evid-sell-{i}");
+        out.push((txbuild::pump_trade_tx(&acc, &t, 900_000_000_000_000, Emission::Both, json!(1), &sig), sig));
+    }
+    out
 }
 
 #[test]
 fn transaction_evidence_verifies_curve_trades_and_catches_mismatches() {
-    let (tx, sig) = curve_trade_tx(false, false);
-    let v = verify_tx(&tx, &sig);
-    assert!(v.passed, "{:#?}", v.checks);
-    assert_eq!(v.classification, vec!["trade_buy"]);
-    assert_eq!((v.slot, v.block_time), (123, Some(1_760_000_000)));
-    for name in ["trade.user_token_delta", "trade.direction", "trade.token_conservation", "trade.protocol_fee", "trade.creator_fee", "trade.curve_invariant"] {
-        assert!(v.checks.iter().any(|c| c.name == name && c.ok), "{name}");
+    let txs = curve_trades(1, 1);
+    for (tx, sig) in &txs {
+        let v = verify_tx(tx, sig);
+        assert!(v.passed, "{:#?}", v.checks);
+        for name in [
+            "trade.instruction",
+            "trade.token_transfer",
+            "trade.curve_vault_delta",
+            "trade.user_token_delta",
+            "trade.sol_amount",
+            "trade.protocol_fee_observed",
+            "trade.creator_fee_observed",
+            "trade.protocol_fee_formula",
+            "trade.creator_fee_formula",
+            "trade.curve_invariant",
+            "token.mint_conservation",
+        ] {
+            assert!(v.checks.iter().any(|c| c.name == name && c.outcome == Outcome::Pass), "{name}: {:#?}", v.checks);
+        }
+        assert_eq!(v.event_outcomes(0).1 + v.event_outcomes(0).2, 0, "no failed or inconclusive hard check");
     }
-    assert!(v.checks.iter().any(|c| c.name == "trade.user_sol_delta" && c.ok), "user paid sol + fees + tx fee");
-    // decoder output that disagrees with balance evidence fails a HARD check
-    let (tx, sig) = curve_trade_tx(true, false);
+    let v = verify_tx(&txs[0].0, &txs[0].1);
+    assert_eq!(v.classification, vec!["trade_buy"]);
+    assert_eq!(v.duplicates_merged, 1, "log + self-CPI copy of one trade merged");
+    assert_eq!(verify_tx(&txs[1].0, &txs[1].1).version, "1");
+    // decoder output that disagrees with chain evidence fails HARD checks
+    let mut c = Curve::new("EVID");
+    let acc = txbuild::CurveAccounts::of(&c);
+    let PumpEvent::Trade(t) = c.buy(wallet("u"), 300_000_000, 0).unwrap() else { panic!() };
+    let mut bad = t.clone();
+    bad.token_amount += 1;
+    let mut tx = txbuild::SynthTx::new(&t.user.to_string(), json!(0));
+    tx.token(&acc.vault, &acc.mint, &acc.curve, Some(900_000_000_000_000), Some(900_000_000_000_000));
+    txbuild::ensure_user_ata(&mut tx, &t.user.to_string(), &acc.mint, Some(0));
+    txbuild::add_pump_trade_as(&mut tx, &acc, &t, &PumpEvent::Trade(bad), Emission::Both);
+    let v = verify_tx(&tx.build("tampered-event", 1), "tampered-event");
+    assert!(!v.passed);
+    for name in ["trade.token_transfer", "trade.user_token_delta", "trade.curve_vault_delta"] {
+        assert!(v.checks.iter().any(|c| c.name == name && c.outcome == Outcome::Fail && c.hard), "{name}");
+    }
+    // balance evidence that disagrees with the parsed transfers fails too
+    let (mut tx, sig) = curve_trades(1, 0).remove(0);
+    let post = tx["meta"]["postTokenBalances"].as_array_mut().unwrap();
+    let e = post.iter_mut().find(|b| b["owner"] != json!(acc.curve)).unwrap();
+    let amt: i128 = e["uiTokenAmount"]["amount"].as_str().unwrap().parse().unwrap();
+    e["uiTokenAmount"]["amount"] = json!((amt - 5).to_string());
     let v = verify_tx(&tx, &sig);
     assert!(!v.passed);
-    assert!(v.checks.iter().any(|c| c.name == "trade.user_token_delta" && !c.ok && c.hard));
-    let (tx, sig) = curve_trade_tx(false, true);
-    assert!(!verify_tx(&tx, &sig).passed);
+    assert!(v.checks.iter().any(|c| c.name == "trade.user_token_delta" && c.outcome == Outcome::Fail));
+    assert!(v.checks.iter().any(|c| c.name == "token.mint_conservation" && c.outcome == Outcome::Fail));
 }
 
 #[test]
-fn pumpswap_swap_verified_against_pool_vault_deltas() {
+fn pumpswap_swap_verified_against_instruction_accounts() {
     let mint = Pubkey::synthetic("mint:VAULT");
     let mut p = Pool::new("VAULT", mint, 500_000_000_000_000, 80_000_000_000);
-    let ev = p.buy(wallet("u"), 1_000_000_000, 0);
-    let pumpswap::PumpSwapEvent::Swap(s) = &ev else { panic!() };
-    let mut data = anchor::EVENT_IX_TAG.to_vec();
-    data.extend(pumpswap::encode(&ev));
-    let (pool, user, m) = (p.pool.to_string(), wallet("u").to_string(), mint.to_string());
-    let tx = json!({
-        "slot": 9, "blockTime": 1,
-        "meta": {"err": null, "fee": 5000, "logMessages": build::pumpswap_inner(&[ev.clone()]).0,
-            "innerInstructions": [{"index": 0, "instructions": [{"programId": programs::PUMP_SWAP, "data": bs58::encode(&data).into_string()}]}],
-            "preTokenBalances": [tb(&pool, &m, s.pool_base_token_reserves as i128, 1), tb(&pool, WSOL_MINT, s.pool_quote_token_reserves as i128, 2)],
-            "postTokenBalances": [tb(&pool, &m, (s.pool_base_token_reserves - s.base_amount) as i128, 1), tb(&pool, WSOL_MINT, (s.pool_quote_token_reserves + s.quote_amount_pool) as i128, 2), tb(&user, &m, s.base_amount as i128, 3)],
-            "preBalances": [], "postBalances": []},
-        "transaction": {"signatures": ["ps"], "message": {"accountKeys": []}}
-    });
-    let v = verify_tx(&tx, "ps");
-    assert!(v.passed, "{:#?}", v.checks);
-    assert_eq!(v.items, vec!["pumpswap/BuyEvent"]);
+    let buy = p.buy(wallet("u"), 1_000_000_000, 0);
+    let sell = p.sell(wallet("u"), 1_000_000_000, 0);
+    for (ev, item) in [(buy, "pumpswap/BuyEvent"), (sell, "pumpswap/SellEvent")] {
+        let tx = txbuild::pumpswap_swap_tx(&ev, &mint.to_string(), json!(1), "ps");
+        let v = verify_tx(&tx, "ps");
+        assert!(v.passed, "{:#?}", v.checks);
+        assert_eq!(v.items, vec![item]);
+        assert_eq!(v.event_outcomes(0).1 + v.event_outcomes(0).2, 0, "{:#?}", v.checks);
+        for name in ["swap.instruction", "swap.pool_base_delta", "swap.pool_quote_delta", "swap.user_base_delta", "swap.protocol_fee_observed", "swap.creator_fee_observed", "swap.lp_fee"] {
+            assert!(v.checks.iter().any(|c| c.name == name && c.outcome == Outcome::Pass), "{name}");
+        }
+    }
 }
 
 #[test]
-fn summary_marks_layouts_mainnet_verified_only_with_enough_passing_events() {
-    let mut results = Vec::new();
-    for _ in 0..3 {
-        let (tx, sig) = curve_trade_tx(false, false);
-        results.push(verify_tx(&tx, &sig));
-    }
+fn summary_marks_venues_mainnet_verified_only_with_enough_fully_verified_events() {
+    let mut results: Vec<_> = curve_trades(2, 1).iter().map(|(t, s)| verify_tx(t, s)).collect();
     let s = summarize(&results, 5);
     assert!(!s.items["pump_bonding_curve/TradeEvent"].mainnet_verified, "3 < 5 samples");
-    for _ in 0..2 {
-        let (tx, sig) = curve_trade_tx(false, false);
-        results.push(verify_tx(&tx, &sig));
-    }
+    assert_eq!(s.venues["pump_bonding_curve"].status, "insufficient_evidence");
+    results = curve_trades(4, 2).iter().map(|(t, s)| verify_tx(t, s)).collect();
     let s = summarize(&results, 5);
     assert!(s.items["pump_bonding_curve/TradeEvent"].mainnet_verified);
-    assert_eq!(s.venues_mainnet_verified["pump_bonding_curve"], true);
-    assert_eq!(s.venues_mainnet_verified["pumpswap"], false, "no PumpSwap samples → stays unverified");
-    let (tx, sig) = curve_trade_tx(true, false);
+    assert_eq!(s.venues["pump_bonding_curve"].status, "mainnet_verified", "{:#?}", s.venues);
+    assert!(s.venues_mainnet_verified["pump_bonding_curve"]);
+    assert!(!s.venues_mainnet_verified["pumpswap"], "no PumpSwap samples → stays unverified");
+    assert_eq!(s.venues["raydium_amm_v4"].status, "disabled");
+    assert_eq!(s.venues["pump_bonding_curve"].duplicate_emissions_merged, 6);
+    // buys only → not verified even with many events
+    let only_buys: Vec<_> = curve_trades(6, 0).iter().map(|(t, s)| verify_tx(t, s)).collect();
+    assert_eq!(summarize(&only_buys, 5).venues["pump_bonding_curve"].status, "insufficient_evidence");
+    // any hard failure revokes verification
+    let (mut tx, sig) = curve_trades(1, 0).remove(0);
+    let fee_rec = Pubkey::synthetic("fee-recipient").to_string();
+    let keys: Vec<String> = tx["transaction"]["message"]["accountKeys"].as_array().unwrap().iter().map(|k| k["pubkey"].as_str().unwrap().to_string()).collect();
+    let i = keys.iter().position(|k| *k == fee_rec).unwrap();
+    let post = tx["meta"]["postBalances"][i].as_i64().unwrap();
+    tx["meta"]["postBalances"][i] = json!(post - 1);
     results.push(verify_tx(&tx, &sig));
     let s = summarize(&results, 5);
-    assert!(!s.items["pump_bonding_curve/TradeEvent"].mainnet_verified, "any hard failure revokes verification");
-    assert!(s.failures.iter().any(|f| f.contains("trade.user_token_delta")), "{:?}", s.failures);
+    assert_eq!(s.venues["pump_bonding_curve"].status, "MISMATCH");
+    assert!(!s.items["pump_bonding_curve/TradeEvent"].mainnet_verified);
+    assert!(s.failures.iter().any(|f| f.contains("trade.protocol_fee_observed")), "{:?}", s.failures);
+    assert!(s.venues["pump_bonding_curve"].examples.iter().any(|e| e.contains("protocol_fee_observed")));
 }
 
 /// WS server accepting logsSubscribe but rejecting transactionSubscribe (common on plain RPC).
@@ -332,8 +359,7 @@ async fn sensitivity_never_improves_results_and_split_is_fixed_by_time() {
 async fn capture_cli_writes_provenance_and_verification_summary() {
     let mut txs = std::collections::HashMap::new();
     let mut sigs = Vec::new();
-    for i in 0..6 {
-        let (mut tx, _) = curve_trade_tx(false, false);
+    for (i, (mut tx, _)) in curve_trades(4, 2).into_iter().enumerate() {
         let sig = format!("capsig{i}");
         tx["transaction"]["signatures"] = json!([sig.clone()]);
         tx["slot"] = json!(1000 + i);
@@ -350,7 +376,16 @@ async fn capture_cli_writes_provenance_and_verification_summary() {
                         json!(sigs.iter().map(|s| json!({"signature": s, "slot": 1, "err": null, "blockTime": 1})).collect::<Vec<_>>())
                     }
                     "getSignaturesForAddress" => json!([]),
-                    "getTransaction" => txs.get(req["params"][0].as_str().unwrap()).cloned().unwrap_or(Value::Null),
+                    "getTransaction" => {
+                        let tx = txs.get(req["params"][0].as_str().unwrap()).cloned().unwrap_or(Value::Null);
+                        // real provider behaviour: a version-1 transaction requested without
+                        // maxSupportedTransactionVersion ≥ 1 is an error (-32015)
+                        let max = req["params"][1]["maxSupportedTransactionVersion"].as_u64();
+                        if tx["version"].as_u64().is_some_and(|v| max.is_none_or(|m| v > m)) {
+                            return Json(json!({"jsonrpc":"2.0","id":1,"error":{"code":-32015,"message":"Transaction version (1) is not supported by the requesting client."}}));
+                        }
+                        tx
+                    }
                     _ => Value::Null,
                 };
                 Json(json!({"jsonrpc":"2.0","id":1,"result":r}))
@@ -362,9 +397,14 @@ async fn capture_cli_writes_provenance_and_verification_summary() {
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path().to_str().unwrap().to_string();
+    // an existing (user) fixture must never be modified or replaced
+    let original = r#"{"provenance":{"network":"user-original"},"keep":"byte-identical"}"#;
+    std::fs::write(dir.path().join("capsig0.json"), original).unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    let r = reports.path().to_str().unwrap().to_string();
     let out = tokio::task::spawn_blocking(move || {
         std::process::Command::new(env!("CARGO_BIN_EXE_sniper"))
-            .args(["capture", "--from-live", "6", "--out", &d])
+            .args(["capture", "--from-live", "5", "--max-requests", "40", "--max-seconds", "60", "--rate", "50", "--out", &d, "--report-dir", &r])
             .env("SOLANA_WS_URLS", "ws://127.0.0.1:9/?api-key=CAPTURESECRET77")
             .env("SOLANA_RPC_URLS", &rpc)
             .output()
@@ -380,8 +420,17 @@ async fn capture_cli_writes_provenance_and_verification_summary() {
     assert_eq!(f["provenance"]["network"], "mainnet-beta");
     assert_eq!(f["provenance"]["slot"], 1003);
     assert_eq!(f["provenance"]["classification"][0], "trade_buy");
-    let v: Value = serde_json::from_str(&std::fs::read_to_string(dir.path().join("verification.json")).unwrap()).unwrap();
-    assert_eq!(v["files"], 6);
-    assert_eq!(v["items"]["pump_bonding_curve/TradeEvent"]["mainnet_verified"], true, "{stdout}");
-    assert!(stdout.contains("MAINNET VERIFIED"));
+    assert_eq!(f["provenance"]["request"]["maxSupportedTransactionVersion"], 1);
+    assert_eq!(std::fs::read_to_string(dir.path().join("capsig0.json")).unwrap(), original, "existing fixture untouched");
+    let v1: Value = serde_json::from_str(&std::fs::read_to_string(dir.path().join("capsig5.json")).unwrap()).unwrap();
+    assert_eq!(v1["provenance"]["transaction_version"], "1", "version-1 transaction captured");
+    assert!(stdout.contains("saved 5/5 new unique transactions"), "{stdout}");
+    assert!(stdout.contains("1 already captured"), "{stdout}");
+    assert!(!dir.path().join("verification.json").exists(), "reports are not written into the fixture directory");
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(reports.path().join("verification.json")).unwrap()).unwrap();
+    assert_eq!(v["files"], 5);
+    assert_eq!(v["venues"]["pump_bonding_curve"]["status"], "mainnet_verified", "{stdout}");
+    assert_eq!(v["venues"]["pumpswap"]["status"], "insufficient_evidence");
+    assert!(stdout.contains("MAINNET_VERIFIED"), "{stdout}");
+    assert!(reports.path().join("verification-detail.json").exists());
 }

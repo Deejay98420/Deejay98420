@@ -70,7 +70,10 @@ pub fn verification_with(summary: Option<&crate::verify::VerificationSummary>) -
                     _ => v.status.into(),
                 },
                 evidence: match real {
-                    Some(r) => format!("{} real txs / {} events; hard checks {} passed, {} failed. {}", r.transactions, r.events, r.hard_checks_passed, r.hard_checks_failed, v.evidence),
+                    Some(r) => format!(
+                        "{} real txs / {} events ({} fully verified); hard checks {} passed, {} failed, {} inconclusive. {}",
+                        r.transactions, r.events, r.events_fully_verified, r.hard_checks_passed, r.hard_checks_failed, r.hard_checks_inconclusive, v.evidence
+                    ),
                     None => v.evidence.into(),
                 },
             }
@@ -83,7 +86,15 @@ pub fn verification_with(summary: Option<&crate::verify::VerificationSummary>) -
             Some(s) if s.files > 0 => format!("{} captured", s.files),
             _ => "pending".into(),
         },
-        evidence: "`sniper capture` + `sniper verify-fixtures` (fixtures/real/verification.json)".into(),
+        evidence: match summary {
+            Some(s) => s
+                .venues
+                .iter()
+                .map(|(v, r)| format!("{v}: {}", r.status))
+                .collect::<Vec<_>>()
+                .join("; "),
+            None => "`./scripts/sniper check --capture 25` (reports/verification/verification.json)".into(),
+        },
     });
     rows
 }
@@ -116,11 +127,35 @@ pub fn verification() -> Vec<Verification> {
     v
 }
 
+/// Where a decoded event came from inside its transaction.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Provenance {
+    /// "log" (`Program data:`), "cpi" (Anchor self-CPI inner instruction) or "log+cpi" when the
+    /// same event was emitted through both channels and was merged into one.
+    pub channel: String,
+    /// Top-level instruction index the event was emitted under.
+    pub outer_ix: Option<u16>,
+    /// Inner-instruction position of the self-CPI carrying the event (cpi channel).
+    pub inner_pos: Option<u16>,
+    /// Call depth of the emitting program (log channel) or of the self-CPI (cpi channel).
+    pub stack_height: Option<u8>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Decoded {
-    /// Index within the transaction (log/inner-ix order) — together with the signature this is a unique id.
+    /// Ordinal within the transaction (log order; CPI-only events 1000+) — with the signature a unique id.
     pub index: u16,
     pub event: VenueEvent,
+    #[serde(default)]
+    pub provenance: Provenance,
+}
+
+impl Decoded {
+    /// Stable event identifier: signature, instruction provenance and ordinal.
+    pub fn event_id(&self, signature: &str) -> String {
+        let o = |x: Option<u16>| x.map(|v| v.to_string()).unwrap_or_else(|| "-".into());
+        format!("{signature}:{}:{}:{}", o(self.provenance.outer_ix), o(self.provenance.inner_pos), self.index)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -129,6 +164,8 @@ pub struct DecodeOutcome {
     pub warnings: Vec<String>,
     /// Transaction failed on chain: no state changes are applied.
     pub tx_failed: bool,
+    /// Events seen through both the log and the self-CPI channel and merged (counted once).
+    pub duplicates_merged: u32,
 }
 
 fn program_venue(id: &str) -> Option<Venue> {
@@ -149,6 +186,11 @@ fn decode_anchor(venue: Venue, disc: [u8; 8], body: &[u8]) -> Result<Option<Venu
 }
 
 /// Decode all supported venue events in a transaction. Unknown programs / discriminators are skipped.
+///
+/// Anchor programs can emit the same event twice: as a `Program data:` log (`emit!`) and as a
+/// self-CPI inner instruction (`emit_cpi!`). A full transaction then carries both copies of ONE
+/// trade. Copies are merged when venue, payload bytes and top-level instruction match (pairing is
+/// one-to-one, so genuinely repeated trades in one transaction are all kept).
 pub fn decode_raw(raw: &RawEvent) -> DecodeOutcome {
     let mut out = DecodeOutcome::default();
     if raw.err.is_some() {
@@ -158,6 +200,9 @@ pub fn decode_raw(raw: &RawEvent) -> DecodeOutcome {
     let b64 = base64::engine::general_purpose::STANDARD;
     let mut stack: Vec<String> = Vec::new();
     let mut idx: u16 = 0;
+    let mut outer: Option<u16> = None;
+    // (venue, payload) of each log-channel event, aligned with out.events; None for ray_log
+    let mut log_keys: Vec<Option<(Venue, Vec<u8>)>> = Vec::new();
     for line in &raw.logs {
         if let Some(rest) = line.strip_prefix("Program ") {
             if let Some(data) = rest.strip_prefix("data: ") {
@@ -168,7 +213,9 @@ pub fn decode_raw(raw: &RawEvent) -> DecodeOutcome {
                         if let Some((disc, body)) = anchor::split_log_event(&bytes) {
                             match decode_anchor(venue, disc, body) {
                                 Ok(Some(ev)) => {
-                                    out.events.push(Decoded { index: idx, event: ev });
+                                    let provenance = Provenance { channel: "log".into(), outer_ix: outer, inner_pos: None, stack_height: Some(stack.len().min(255) as u8) };
+                                    out.events.push(Decoded { index: idx, event: ev, provenance });
+                                    log_keys.push(Some((venue, bytes.clone())));
                                 }
                                 Ok(None) => {}
                                 Err(e) => out.warnings.push(format!("{} data decode: {e}", venue.as_str())),
@@ -185,7 +232,11 @@ pub fn decode_raw(raw: &RawEvent) -> DecodeOutcome {
                     if stack.last().map(|s| s.as_str()) == Some(programs::RAYDIUM_AMM_V4) {
                         match b64.decode(payload.trim()) {
                             Ok(bytes) => match raydium_v4::decode(&bytes) {
-                                Ok(l) => out.events.push(Decoded { index: idx, event: VenueEvent::Raydium(l) }),
+                                Ok(l) => {
+                                    let provenance = Provenance { channel: "log".into(), outer_ix: outer, inner_pos: None, stack_height: Some(stack.len().min(255) as u8) };
+                                    out.events.push(Decoded { index: idx, event: VenueEvent::Raydium(l), provenance });
+                                    log_keys.push(None);
+                                }
                                 Err(e) => out.warnings.push(format!("ray_log: {e}")),
                             },
                             Err(e) => out.warnings.push(format!("ray_log base64: {e}")),
@@ -200,6 +251,9 @@ pub fn decode_raw(raw: &RawEvent) -> DecodeOutcome {
             let id = parts.next().unwrap_or("");
             let tail = parts.next().unwrap_or("");
             if tail.starts_with("invoke [") {
+                if tail == "invoke [1]" {
+                    outer = Some(outer.map(|o| o + 1).unwrap_or(0));
+                }
                 stack.push(id.to_string());
             } else if tail == "success" || tail.starts_with("failed") {
                 stack.pop();
@@ -209,20 +263,41 @@ pub fn decode_raw(raw: &RawEvent) -> DecodeOutcome {
         }
     }
     // emit_cpi events delivered as inner instructions (full-transaction providers only)
+    let mut merged = vec![false; out.events.len()];
     for ix in &raw.inner_ix {
         let Some(venue) = program_venue(&ix.program_id) else { continue };
         let Ok(bytes) = b64.decode(&ix.data_b64) else {
             out.warnings.push("inner ix base64".into());
             continue;
         };
-        if let Some((disc, body)) = anchor::split_cpi_event(&bytes) {
-            match decode_anchor(venue, disc, body) {
-                Ok(Some(ev)) => out.events.push(Decoded { index: 1000 + idx, event: ev }),
-                Ok(None) => {}
-                Err(e) => out.warnings.push(format!("{} cpi decode: {e}", venue.as_str())),
-            }
-            idx += 1;
+        let Some((disc, body)) = anchor::split_cpi_event(&bytes) else { continue };
+        let payload = &bytes[anchor::EVENT_IX_TAG.len()..];
+        // same event already decoded from the log channel → merge, never count twice
+        let twin = (0..log_keys.len()).find(|&i| {
+            !merged[i]
+                && log_keys[i].as_ref().is_some_and(|(v, p)| *v == venue && p.as_slice() == payload)
+                && match (out.events[i].provenance.outer_ix, ix.outer_index) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => true,
+                }
+        });
+        if let Some(i) = twin {
+            merged[i] = true;
+            let p = &mut out.events[i].provenance;
+            p.channel = "log+cpi".into();
+            p.inner_pos = ix.position;
+            out.duplicates_merged += 1;
+            continue;
         }
+        match decode_anchor(venue, disc, body) {
+            Ok(Some(ev)) => {
+                let provenance = Provenance { channel: "cpi".into(), outer_ix: ix.outer_index, inner_pos: ix.position, stack_height: ix.stack_height };
+                out.events.push(Decoded { index: 1000 + idx, event: ev, provenance });
+            }
+            Ok(None) => {}
+            Err(e) => out.warnings.push(format!("{} cpi decode: {e}", venue.as_str())),
+        }
+        idx += 1;
     }
     out
 }
@@ -257,7 +332,7 @@ pub mod build {
             .map(|e| {
                 let mut data = anchor::EVENT_IX_TAG.to_vec();
                 data.extend(pumpswap::encode(e));
-                InnerIx { program_id: programs::PUMP_SWAP.into(), data_b64: b64.encode(data) }
+                InnerIx { program_id: programs::PUMP_SWAP.into(), data_b64: b64.encode(data), outer_index: None, position: None, stack_height: None }
             })
             .collect();
         (logs, inner)
