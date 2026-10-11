@@ -478,6 +478,30 @@ impl TxModel {
             .collect()
     }
 
+    /// Calling instructions of `i` (its CPI parents up to the top-level instruction), nearest first.
+    pub fn ancestors(&self, i: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let Some(me) = self.ixs.get(i) else { return out };
+        let Some(mut h) = me.stack_height else { return out };
+        let mut j = i;
+        while h > 1 && j > 0 {
+            j -= 1;
+            let x = &self.ixs[j];
+            if x.outer != me.outer {
+                break;
+            }
+            match x.stack_height {
+                Some(hx) if hx < h => {
+                    out.push(j);
+                    h = hx;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        out
+    }
+
     /// Human-readable instruction reference: "ix 3" or "ix 3.2".
     pub fn ix_ref(&self, i: usize) -> String {
         match self.ixs.get(i) {

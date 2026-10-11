@@ -22,6 +22,7 @@ pub mod verify;
 pub mod txmodel;
 pub mod ixlayout;
 pub mod txbuild;
+pub mod capture;
 pub mod state;
 pub mod store;
 pub mod strategy;

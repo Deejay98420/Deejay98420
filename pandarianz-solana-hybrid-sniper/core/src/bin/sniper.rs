@@ -28,6 +28,12 @@ enum Mode {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum CaptureVenue {
+    All,
+    Pumpswap,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum StoreKind {
     Postgres,
     Memory,
@@ -86,6 +92,10 @@ enum Cmd {
         dir: PathBuf,
         #[arg(long, default_value = "../reports/verification")]
         report_dir: PathBuf,
+        /// count exact balance reconciliations whose accounts a calling (wrapper) instruction also
+        /// names as PASS (default: strict, reported as INCONCLUSIVE)
+        #[arg(long)]
+        accept_ancestor_scoped: bool,
     },
     /// Calibration-split analysis of the expected-move model (read-only; never changes config).
     Calibrate {
@@ -114,6 +124,10 @@ enum Cmd {
         /// concurrent requests
         #[arg(long, default_value_t = 2)]
         concurrency: usize,
+        /// `all`: sample recent signatures of both programs; `pumpswap`: listen to PumpSwap with
+        /// logsSubscribe (any plan) and fetch only Buy/Sell candidates, balanced across sides
+        #[arg(long, value_enum, default_value = "all")]
+        venue: CaptureVenue,
         #[arg(long, default_value = "../fixtures/real")]
         out: PathBuf,
         #[arg(long, default_value = "../reports/verification")]
@@ -135,6 +149,11 @@ enum Cmd {
     },
     /// Apply database migrations.
     Migrate,
+    /// Forensic view of captured transaction file(s): events, emitting instruction, account roles,
+    /// balance deltas and in-instruction movements (read-only; files are not modified).
+    Explain {
+        files: Vec<PathBuf>,
+    },
     /// Show which provider endpoints are actually usable (redacted; keys are never printed).
     Endpoints,
     /// Query a running engine's health endpoint.
@@ -253,6 +272,13 @@ async fn main() -> anyhow::Result<()> {
             println!("full report: {}", path.display());
             Ok(())
         }
+        Cmd::Explain { files } => {
+            for f in files {
+                let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&f)?)?;
+                println!("{}", sniper_core::verify::explain_tx(&doc["rpc_result"], doc["signature"].as_str().unwrap_or("")));
+            }
+            Ok(())
+        }
         Cmd::Endpoints => {
             use sniper_core::live::endpoint_status;
             let (ws, m1) = endpoint_status(if std::env::var("SOLANA_WS_URLS").is_ok() { "SOLANA_WS_URLS" } else { "SOLANA_WS_URL" }, &["wss", "ws"]);
@@ -271,12 +297,16 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Cmd::Capture { signatures, from_live, max_requests, max_seconds, rate, concurrency, out, report_dir } => {
+        Cmd::Capture { signatures, from_live, max_requests, max_seconds, rate, concurrency, venue, out, report_dir } => {
             let lim = CaptureLimits { max_requests, max_seconds, rate, concurrency };
-            capture(signatures, from_live, lim, out, report_dir).await
+            match venue {
+                CaptureVenue::All => capture(signatures, from_live, lim, out, report_dir).await,
+                CaptureVenue::Pumpswap => capture_pumpswap(from_live.unwrap_or(20), lim, out, report_dir).await,
+            }
         }
         Cmd::Doctor { listen_seconds, out } => doctor(listen_seconds, out).await,
-        Cmd::VerifyFixtures { dir, report_dir } => {
+        Cmd::VerifyFixtures { dir, report_dir, accept_ancestor_scoped } => {
+            sniper_core::verify::set_accept_ancestor_scoped(accept_ancestor_scoped);
             verify_fixtures(&dir, &report_dir, EngineConfig::load(std::env::var("SNIPER_CONFIG").ok().map(PathBuf::from).as_deref())?.evidence.min_events_for_mainnet_verified).map(|_| ())
         }
         Cmd::Calibrate { profile } => calibrate(&profile).await,
@@ -836,6 +866,208 @@ async fn capture(signatures: Vec<String>, from_live: Option<usize>, lim: Capture
     verify_fixtures(&out, &report_dir, EngineConfig::load(std::env::var("SNIPER_CONFIG").ok().map(PathBuf::from).as_deref())?.evidence.min_events_for_mainnet_verified).map(|_| ())
 }
 
+/// Selective PumpSwap capture: logsSubscribe(mentions PumpSwap) → candidates whose PumpSwap
+/// instruction log says Buy/Sell → bounded, deduplicated per-side queues → getTransaction through
+/// the shared scheduler (rate, budget, time) → saved only if a PumpSwap swap event decodes.
+async fn capture_pumpswap(target: usize, lim: CaptureLimits, out: PathBuf, report_dir: PathBuf) -> anyhow::Result<()> {
+    use futures_util::{SinkExt, StreamExt};
+    use sniper_core::capture::{pumpswap_side_from_logs, Offer, Selector, Side};
+    use sniper_core::rpc::{RpcClient, RpcError, SchedulerConfig};
+    use tokio_tungstenite::tungstenite::Message;
+    let rpc_urls = sniper_core::live::rpc_urls_from_env();
+    anyhow::ensure!(!rpc_urls.is_empty(), "capture needs an RPC endpoint (SOLANA_RPC_URLS, or SOLANA_WS_URLS from which it is derived)");
+    let ws_urls = sniper_core::live::endpoint_list(&std::env::var("SOLANA_WS_URLS").or_else(|_| std::env::var("SOLANA_WS_URL")).unwrap_or_default(), &["wss", "ws"]);
+    anyhow::ensure!(!ws_urls.is_empty(), "--venue pumpswap listens with logsSubscribe: set SOLANA_WS_URLS");
+    anyhow::ensure!(lim.rate > 0.0 && lim.concurrency > 0 && lim.max_requests > 0 && target > 0, "--from-live, --rate, --concurrency and --max-requests must be positive");
+    let mut secrets = rpc_urls.clone();
+    secrets.extend(ws_urls.clone());
+    let t0 = std::time::Instant::now();
+    let deadline = t0 + Duration::from_secs(lim.max_seconds);
+    let cfg = SchedulerConfig {
+        rate_per_s: lim.rate,
+        burst: (lim.rate.ceil() as u32).max(1),
+        max_in_flight: lim.concurrency,
+        max_queue: lim.concurrency * 4,
+        max_wait: Duration::from_secs(lim.max_seconds.clamp(1, 30)),
+        request_budget: Some(lim.max_requests),
+        timeout: Duration::from_secs(15),
+        ..SchedulerConfig::default()
+    };
+    let rpc = Arc::new(RpcClient::with_config(rpc_urls.clone(), cfg)?);
+    std::fs::create_dir_all(&out)?;
+    let existing = existing_signatures(&out);
+    println!(
+        "PUMPSWAP CAPTURE (logsSubscribe + read-only getTransaction, maxSupportedTransactionVersion={}): target {target} new swaps (buys and sells), ≤{} requests, ≤{}s, {} req/s; {} files already in {}",
+        rpc.max_tx_version, lim.max_requests, lim.max_seconds, lim.rate, existing.len(), out.display()
+    );
+    // WebSocket reader → bounded channel (try_send: never blocks, drops counted)
+    let (tx, mut rx) = mpsc::channel::<(String, Vec<String>, bool)>(512);
+    let dropped_ws = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let ws_url = ws_urls[0].clone();
+    let dw = dropped_ws.clone();
+    let reader = tokio::spawn(async move {
+        let (mut ws, _) = tokio_tungstenite::connect_async(ws_url.as_str()).await.map_err(|e| format!("connect: {e}"))?;
+        let req = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"logsSubscribe","params":[{"mentions":[programs::PUMP_SWAP]},{"commitment":"confirmed"}]});
+        ws.send(Message::Text(req.to_string())).await.map_err(|e| format!("send: {e}"))?;
+        loop {
+            let msg = match tokio::time::timeout(Duration::from_secs(30), ws.next()).await {
+                Err(_) => return Err("no WebSocket message for 30 s".to_string()),
+                Ok(None) => return Err("WebSocket closed by provider".into()),
+                Ok(Some(Err(e))) => return Err(format!("WebSocket: {e}")),
+                Ok(Some(Ok(m))) => m,
+            };
+            match msg {
+                Message::Text(t) => {
+                    if let Some((_, false, detail)) = sniper_core::stream::ws::parse_ack(&t) {
+                        return Err(format!("logsSubscribe rejected: {detail}"));
+                    }
+                    if let Some(sniper_core::stream::ws::Parsed::Event(ev)) = sniper_core::stream::ws::parse_message(&t, "capture", sniper_core::types::Commitment::Confirmed, wall_us()) {
+                        if tx.try_send((ev.signature, ev.logs, ev.err.is_some())).is_err() {
+                            dw.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+                Message::Ping(p) => {
+                    let _ = ws.send(Message::Pong(p)).await;
+                }
+                Message::Close(_) => return Err("WebSocket closed by provider".into()),
+                _ => {}
+            }
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), String>(())
+    });
+    let mut sel = Selector::new(lim.concurrency.max(1) * 25, existing.iter().cloned());
+    let (mut notifications, mut not_swap, mut saved_buys, mut saved_sells, mut no_swap_decoded, mut not_found, mut invalid, mut side_mismatch) = (0u64, 0u64, 0usize, 0usize, 0u64, 0u64, 0u64, 0u64);
+    let mut errors: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut examples: Vec<String> = Vec::new();
+    let mut manifest: Vec<serde_json::Value> = Vec::new();
+    let stop_reason: String = loop {
+        if saved_buys + saved_sells >= target {
+            break "target reached".into();
+        }
+        if std::time::Instant::now() >= deadline {
+            break format!("time limit ({}s) reached", lim.max_seconds);
+        }
+        if rpc.budget_remaining() == Some(0) {
+            break format!("request budget ({}) spent", lim.max_requests);
+        }
+        while let Ok((sig, logs, failed)) = rx.try_recv() {
+            notifications += 1;
+            match pumpswap_side_from_logs(&logs, failed) {
+                Some(side) => {
+                    let _: Offer = sel.offer(&sig, side);
+                }
+                None => not_swap += 1,
+            }
+        }
+        let Some((sig, cand)) = sel.next(saved_buys, saved_sells) else {
+            if reader.is_finished() {
+                break "WebSocket stream ended with no queued candidates".into();
+            }
+            let wait = deadline.saturating_duration_since(std::time::Instant::now()).min(Duration::from_secs(1));
+            if let Ok(Some((sig, logs, failed))) = tokio::time::timeout(wait, rx.recv()).await {
+                notifications += 1;
+                match pumpswap_side_from_logs(&logs, failed) {
+                    Some(side) => {
+                        sel.offer(&sig, side);
+                    }
+                    None => not_swap += 1,
+                }
+            }
+            continue;
+        };
+        match rpc.get_transaction_raw(&sig).await {
+            Ok(raw) if raw.is_null() => not_found += 1,
+            Ok(raw) => {
+                let problems = sniper_core::txmodel::structure_problems(&raw);
+                if !problems.is_empty() {
+                    invalid += 1;
+                    continue;
+                }
+                let v = sniper_core::verify::verify_tx(&raw, &sig);
+                let buys = v.classification.iter().filter(|c| *c == "pool_swap_buy").count();
+                let sells = v.classification.iter().filter(|c| *c == "pool_swap_sell").count();
+                if v.tx_failed || buys + sells == 0 {
+                    no_swap_decoded += 1;
+                    continue;
+                }
+                let side = if buys > 0 { Side::Buy } else { Side::Sell };
+                if side != cand {
+                    side_mismatch += 1;
+                }
+                let doc = serde_json::json!({
+                    "provenance": {"source": "getTransaction (jsonParsed)", "captured_at_us": wall_us(), "network": "mainnet-beta",
+                        "request": {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": rpc.max_tx_version},
+                        "transaction_version": v.version, "slot": v.slot, "block_time": v.block_time, "classification": v.classification,
+                        "sampled_from": "pumpswap logsSubscribe", "candidate_side": format!("{cand:?}"),
+                        "note": "REAL mainnet transaction captured read-only; full RPC result preserved verbatim"},
+                    "signature": sig,
+                    "rpc_result": raw,
+                });
+                let path = out.join(format!("{sig}.json"));
+                let bytes = serde_json::to_string_pretty(&doc)?;
+                match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                    Ok(mut f) => {
+                        use std::io::Write;
+                        f.write_all(bytes.as_bytes())?;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(e.into()),
+                }
+                use sha2::Digest;
+                manifest.push(serde_json::json!({"signature": sig, "side": format!("{side:?}"), "version": v.version, "slot": v.slot, "sha256": format!("{:x}", sha2::Sha256::digest(bytes.as_bytes()))}));
+                match side {
+                    Side::Buy => saved_buys += 1,
+                    Side::Sell => saved_sells += 1,
+                }
+            }
+            Err(e) => {
+                *errors.entry(e.class()).or_default() += 1;
+                if examples.len() < 3 && !examples.iter().any(|x| x.contains(&e.class())) {
+                    examples.push(format!("{}…: [{}] {e}", &sig[..8.min(sig.len())], e.class()));
+                }
+                if matches!(e, RpcError::BudgetExhausted) {
+                    break format!("request budget ({}) spent", lim.max_requests);
+                }
+            }
+        }
+    };
+    reader.abort();
+    let reader_note = match reader.await {
+        Ok(Err(e)) => Some(sniper_core::doctor::scrub(&e, &secrets)),
+        _ => None,
+    };
+    let st = rpc.scheduler_stats();
+    let (qb, qs) = sel.queued();
+    println!("PUMPSWAP CAPTURE RESULT: saved {} new swaps ({saved_buys} buys, {saved_sells} sells) of target {target} in {:.0}s — stop reason: {stop_reason}", saved_buys + saved_sells, t0.elapsed().as_secs_f64());
+    println!(
+        "  notifications {notifications}: {not_swap} not a PumpSwap Buy/Sell, {} duplicate/already captured, {} dropped (queue bound), {} dropped at the WebSocket channel; {qb}/{qs} buy/sell candidates left unfetched",
+        sel.duplicates,
+        sel.dropped,
+        dropped_ws.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    println!("  fetched but not saved: {no_swap_decoded} without a decoded PumpSwap swap, {not_found} not found, {invalid} invalid; log-side vs decoded-side mismatches {side_mismatch}");
+    println!(
+        "  requests: {} sent / budget {} (ok {}, http 429 {}, retries {}, cooldowns {}); deferred {}, expired {}, rejected {}",
+        st.http_sent, lim.max_requests, st.ok, st.http_429, st.retries, st.cooldowns, st.deferred, st.expired, st.queue_rejected + st.budget_rejected
+    );
+    if !errors.is_empty() {
+        println!("  errors by class: {errors:?}");
+        for e in &examples {
+            println!("    e.g. {}", sniper_core::doctor::scrub(e, &secrets));
+        }
+    }
+    if let Some(n) = reader_note {
+        println!("  stream: {n}");
+    }
+    std::fs::create_dir_all(&report_dir)?;
+    let mp = report_dir.join(format!("capture-pumpswap-{}.json", wall_us() / 1_000_000));
+    std::fs::write(&mp, serde_json::to_string_pretty(&serde_json::json!({"venue": "pumpswap", "stop_reason": stop_reason, "saved": manifest, "buys": saved_buys, "sells": saved_sells, "requests_sent": st.http_sent, "request_budget": lim.max_requests}))?)?;
+    println!("  PumpSwap evidence manifest: {}", mp.display());
+    verify_fixtures(&out, &report_dir, EngineConfig::load(std::env::var("SNIPER_CONFIG").ok().map(PathBuf::from).as_deref())?.evidence.min_events_for_mainnet_verified).map(|_| ())
+}
+
 fn verify_fixtures(dir: &std::path::Path, report_dir: &std::path::Path, min_events: u64) -> anyhow::Result<sniper_core::verify::VerificationSummary> {
     let mut results = Vec::new();
     let mut files: Vec<_> = std::fs::read_dir(dir)
@@ -907,6 +1139,12 @@ fn verify_fixtures(dir: &std::path::Path, report_dir: &std::path::Path, min_even
         if !r.fee_hypotheses.is_empty() {
             println!("  {:<20} fee routing matched: {:?}", "", r.fee_hypotheses);
         }
+        if !r.fully_verified_by_instruction.is_empty() || r.fully_verified_token_quoted > 0 {
+            println!("  {:<20} fully verified by instruction: {:?}; token-quoted (verified, never traded, not counted): {}", "", r.fully_verified_by_instruction, r.fully_verified_token_quoted);
+        }
+        if !r.reconciled_via_ancestor.is_empty() {
+            println!("  {:<20} exact reconciliations through a wrapper ({} mode): {:?}", "", r.attribution_mode, r.reconciled_via_ancestor);
+        }
         for e in r.examples.iter().take(3) {
             println!("  {:<20} e.g. {}", "", e.chars().take(220).collect::<String>());
         }
@@ -953,7 +1191,10 @@ fn compare_reports(prev: &serde_json::Value, prev_detail: &serde_json::Value, no
                 continue;
             }
             let (name, ev) = (c["name"].as_str().unwrap_or(""), c["event_index"].as_u64().unwrap_or(0) as usize);
-            let after = now_tx.and_then(|t| t.checks.iter().find(|x| x.name == name && x.event_index == ev));
+            // renamed checks: token-quoted curves report trade.quote_amount instead of trade.sol_amount
+            let after = now_tx.and_then(|t| {
+                t.checks.iter().find(|x| x.name == name && x.event_index == ev).or_else(|| t.checks.iter().find(|x| name == "trade.sol_amount" && x.name == "trade.quote_amount" && x.event_index == ev))
+            });
             let (a_out, a_detail, a_ix) = match after {
                 Some(x) => (format!("{:?}", x.outcome).to_lowercase(), x.detail.clone(), x.instruction.clone().unwrap_or_default()),
                 None => ("not produced".into(), String::new(), String::new()),
@@ -965,7 +1206,24 @@ fn compare_reports(prev: &serde_json::Value, prev_detail: &serde_json::Value, no
     if changes.is_empty() {
         println!("    (no previously failing or inconclusive checks)");
     }
-    json!({"venues": venues, "previously_failed_or_inconclusive": changes})
+    // the other direction: checks that passed before and no longer pass (stricter attribution)
+    let mut stricter = Vec::new();
+    for tx in prev_detail.as_array().into_iter().flatten() {
+        let sig = tx["signature"].as_str().unwrap_or("");
+        let Some(now_tx) = now_detail.iter().find(|t| t.signature == sig) else { continue };
+        for c in tx["checks"].as_array().into_iter().flatten() {
+            let before = c["outcome"].as_str().unwrap_or(if c["ok"].as_bool() == Some(true) { "pass" } else { "fail" });
+            if before != "pass" || c["hard"].as_bool() != Some(true) {
+                continue;
+            }
+            let (name, ev) = (c["name"].as_str().unwrap_or(""), c["event_index"].as_u64().unwrap_or(0) as usize);
+            if let Some(x) = now_tx.checks.iter().find(|x| x.name == name && x.event_index == ev && x.outcome != sniper_core::verify::Outcome::Pass) {
+                println!("    {}… {:<30} {:>12} → {:<12} {}", &sig[..8.min(sig.len())], name, "PASS", format!("{:?}", x.outcome).to_uppercase(), x.detail.chars().take(170).collect::<String>());
+                stricter.push(json!({"signature": sig, "event_index": ev, "check": name, "before": "pass", "after": format!("{:?}", x.outcome).to_lowercase(), "after_detail": x.detail}));
+            }
+        }
+    }
+    json!({"venues": venues, "previously_failed_or_inconclusive": changes, "previously_passed_now_not": stricter})
 }
 
 async fn doctor(listen_seconds: u64, out: PathBuf) -> anyhow::Result<()> {

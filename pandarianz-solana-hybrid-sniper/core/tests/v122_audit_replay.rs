@@ -87,8 +87,8 @@ fn balance_only_split_through_a_wrapper_stays_inconclusive() {
     let v = verify_tx(&tx, "5guPtRHy-sig");
     let c = check(&v, "trade.protocol_fee_observed");
     assert_eq!(c.outcome, Outcome::Inconclusive, "{}", c.detail);
-    assert!(c.detail.contains("419337") && c.detail.contains("419336") && c.detail.contains("equals decoded fee 838673"), "{}", c.detail);
-    assert!(c.detail.contains("also named by ix 0"), "{}", c.detail);
+    assert!(c.detail.contains("419337") && c.detail.contains("419336") && c.detail.contains("reconciles exactly with 838673"), "{}", c.detail);
+    assert!(c.detail.contains("calling instruction(s) ix 0 also name"), "{}", c.detail);
     // the instruction itself is matched through the wrapper's CPI
     assert_eq!(check(&v, "trade.instruction").outcome, Outcome::Pass);
     // the same sell as a top-level Pump instruction: accounts named only by it → attributable
