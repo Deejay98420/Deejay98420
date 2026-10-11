@@ -238,38 +238,117 @@ pub fn add_pump_trade(tx: &mut SynthTx, c: &CurveAccounts, ev: &PumpEvent, how: 
 /// Like `add_pump_trade`, but the on-chain effects follow `t` while the emitted event is `emitted`
 /// (lets tests model a decoder/event mismatch).
 pub fn add_pump_trade_as(tx: &mut SynthTx, c: &CurveAccounts, t: &PumpTrade, emitted: &PumpEvent, how: Emission) -> usize {
+    add_pump_trade_opts(tx, c, t, emitted, how, &TradeOpts::default())
+}
+
+/// Variations observed in real mainnet transactions (forensic audit of 15 captures).
+#[derive(Clone, Debug, Default)]
+pub struct TradeOpts {
+    /// buyback recipient passed as a remaining account after `bonding_curve_v2` (official SDK order),
+    /// receiving `share` lamports of the decoded fee; the fee recipient receives the rest
+    pub buyback: Option<(String, u64)>,
+    /// buys only: fee shares paid by direct lamport moves instead of parsed System transfers
+    pub direct_fee_moves: bool,
+    /// the trade is a CPI from this (non-Pump) wrapper program's top-level instruction
+    pub wrapper: Option<String>,
+    /// an extra System transfer into the creator vault inside the trade (not a fee)
+    pub creator_extra: Option<u64>,
+    /// replace the instruction discriminator (unrecognized layout)
+    pub disc: Option<[u8; 8]>,
+    /// sells: close the user's token account in a later top-level instruction
+    pub close_user_ata: bool,
+}
+
+pub fn add_pump_trade_opts(tx: &mut SynthTx, c: &CurveAccounts, t: &PumpTrade, emitted: &PumpEvent, how: Emission, opts: &TradeOpts) -> usize {
     let user = t.user.to_string();
     let ata = user_ata(&user, &c.mint);
     tx.lamports(&user, 0);
-    let disc = if t.is_buy { "66063d1201daebea" } else { "33e685a4017f83ad" };
-    let mut data = hexd(disc);
+    let mut data = opts.disc.map(|d| d.to_vec()).unwrap_or_else(|| hexd(if t.is_buy { "66063d1201daebea" } else { "33e685a4017f83ad" }));
     data.extend(t.token_amount.to_le_bytes());
     data.extend(u64::MAX.to_le_bytes());
     let g = Pubkey::synthetic("pump-global").to_string();
     let ea = Pubkey::synthetic("pump-event-authority").to_string();
-    let accts: Vec<&str> = if t.is_buy {
-        vec![&g, &c.fee_recipient, &c.mint, &c.curve, &c.vault, &ata, &user, SYSTEM_PROGRAM, TOKEN_PROGRAM, &c.creator_vault, &ea, programs::PUMP_FUN]
+    let uva = Pubkey::synthetic(&format!("uva:{user}")).to_string();
+    let gva = Pubkey::synthetic("gva").to_string();
+    let fc = Pubkey::synthetic("fee-config").to_string();
+    let fp = Pubkey::synthetic("fee-program").to_string();
+    let bc2 = Pubkey::synthetic(&format!("bc2:{}", c.mint)).to_string();
+    let mut accts: Vec<String> = if t.is_buy {
+        vec![&g, &c.fee_recipient, &c.mint, &c.curve, &c.vault, &ata, &user, SYSTEM_PROGRAM, TOKEN_PROGRAM, &c.creator_vault, &ea, programs::PUMP_FUN, &gva, &uva, &fc, &fp]
     } else {
-        vec![&g, &c.fee_recipient, &c.mint, &c.curve, &c.vault, &ata, &user, SYSTEM_PROGRAM, &c.creator_vault, TOKEN_PROGRAM, &ea, programs::PUMP_FUN]
+        vec![&g, &c.fee_recipient, &c.mint, &c.curve, &c.vault, &ata, &user, SYSTEM_PROGRAM, &c.creator_vault, TOKEN_PROGRAM, &ea, programs::PUMP_FUN, &fc, &fp]
+    }
+    .into_iter()
+    .map(String::from)
+    .collect();
+    if let Some((bb, _)) = &opts.buyback {
+        accts.push(bc2.clone());
+        accts.push(bb.clone());
+    }
+    let refs: Vec<&str> = accts.iter().map(|s| s.as_str()).collect();
+    // top level: the pump instruction itself, or a wrapper whose CPI runs it at depth 2
+    let (o, d) = match &opts.wrapper {
+        Some(w) => {
+            let mut wa = refs.clone();
+            wa.push(programs::PUMP_FUN);
+            let o = tx.outer(w, &wa, &[9, 9, 9, 9, 9, 9, 9, 9]);
+            tx.inner(o, 2, programs::PUMP_FUN, &refs, &data);
+            tx.log(o, format!("Program {} invoke [2]", programs::PUMP_FUN));
+            (o, 2u8)
+        }
+        None => (tx.outer(programs::PUMP_FUN, &refs, &data), 1u8),
     };
-    let o = tx.outer(programs::PUMP_FUN, &accts, &data);
     tx.log(o, format!("Program log: Instruction: {}", if t.is_buy { "Buy" } else { "Sell" }));
     let (fee, cfee) = (t.fee.unwrap_or(0), t.creator_fee.unwrap_or(0));
+    let share = opts.buyback.as_ref().map(|b| b.1).unwrap_or(0);
+    let child = d + 1;
     if t.is_buy {
-        tx.token_transfer(o, 2, &c.vault, &ata, &c.mint, t.token_amount);
-        tx.sys_transfer(o, 2, &user, &c.curve, t.sol_amount);
-        tx.sys_transfer(o, 2, &user, &c.fee_recipient, fee);
-        tx.sys_transfer(o, 2, &user, &c.creator_vault, cfee);
+        tx.token_transfer(o, child, &c.vault, &ata, &c.mint, t.token_amount);
+        tx.sys_transfer(o, child, &user, &c.curve, t.sol_amount);
+        if opts.direct_fee_moves {
+            tx.lamports(&user, -(fee as i128));
+            tx.lamports(&c.fee_recipient, (fee - share) as i128);
+            if let Some((bb, _)) = &opts.buyback {
+                tx.lamports(bb, share as i128);
+            }
+        } else {
+            tx.sys_transfer(o, child, &user, &c.fee_recipient, fee - share);
+            if let Some((bb, _)) = &opts.buyback {
+                tx.sys_transfer(o, child, &user, bb, share);
+            }
+        }
+        if let Some(x) = opts.creator_extra {
+            tx.sys_transfer(o, child, &user, &c.creator_vault, x);
+        }
+        tx.sys_transfer(o, child, &user, &c.creator_vault, cfee);
     } else {
-        tx.token_transfer(o, 2, &ata, &c.vault, &c.mint, t.token_amount);
+        tx.token_transfer(o, child, &ata, &c.vault, &c.mint, t.token_amount);
         // program-owned curve pays out directly (no System instruction)
         tx.lamports(&c.curve, -(t.sol_amount as i128));
         tx.lamports(&user, (t.sol_amount - fee - cfee) as i128);
-        tx.lamports(&c.fee_recipient, fee as i128);
+        tx.lamports(&c.fee_recipient, (fee - share) as i128);
+        if let Some((bb, _)) = &opts.buyback {
+            tx.lamports(bb, share as i128);
+        }
         tx.lamports(&c.creator_vault, cfee as i128);
     }
-    emit_pump(tx, o, 1, emitted, how);
-    tx.close(o, programs::PUMP_FUN);
+    emit_pump(tx, o, d, emitted, how);
+    if opts.wrapper.is_some() {
+        tx.log(o, format!("Program {} success", programs::PUMP_FUN));
+        let w = opts.wrapper.clone().unwrap();
+        tx.close(o, &w);
+    } else {
+        tx.close(o, programs::PUMP_FUN);
+    }
+    if opts.close_user_ata {
+        let o2 = tx.outer(TOKEN_PROGRAM, &[&ata, &user, &user], &[9]);
+        tx.groups[o2].outer = json!({"program": "spl-token", "programId": TOKEN_PROGRAM, "parsed": {"type": "closeAccount", "info": {"account": ata, "destination": user, "owner": user}}, "stackHeight": null});
+        tx.close(o2, TOKEN_PROGRAM);
+        if let Some(e) = tx.tokens.get_mut(&ata) {
+            e.3 = None; // closed: absent from postTokenBalances
+        }
+        tx.lamports(&user, 2_039_280);
+    }
     o
 }
 

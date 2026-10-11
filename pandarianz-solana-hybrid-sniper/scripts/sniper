@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-command local workflow (macOS / Linux, bash 3.2 compatible). PAPER ONLY.
-#   ./scripts/sniper check [--capture N] [--max-requests R] [--max-seconds S] [--rate RPS]
+#   ./scripts/sniper check [--offline] [--capture N] [--max-requests R] [--max-seconds S] [--rate RPS]
 #        ← one command: PAPER-only safety, regression tests, re-verification of existing captures,
 #          provider diagnostics, optional bounded mainnet capture, final verification report
 #   ./scripts/sniper setup | env-check | endpoints | doctor [SECS] | capture [N] [R] [S] [RPS] | verify-decoders | verify-live [SECS]
@@ -55,7 +55,8 @@ dash_deps() {
 cmd_setup() {
   [ -f "$ROOT/.env" ] || { cp "$ROOT/.env.example" "$ROOT/.env"; say "created .env from .env.example (placeholders only)"; }
   build; dash_deps
-  (cd "$CORE" && "$BIN" gen-fixtures --out "$ROOT/fixtures/synthetic")
+  # the tracked synthetic fixture is only created when missing, never rewritten by setup
+  [ -f "$ROOT/fixtures/synthetic/hybrid_session.jsonl" ] || (cd "$CORE" && "$BIN" gen-fixtures --out "$ROOT/fixtures/synthetic")
   db_up
   (cd "$CORE" && "$BIN" migrate)
   say "setup complete. Next: ./scripts/sniper start"
@@ -233,14 +234,15 @@ cmd_restart() {
 # One command: safety → tests → re-verify existing captures → providers → optional bounded capture
 # → final verification report → next action. Never trades, signs or sends anything.
 cmd_check() {
-  local cap=0 req=150 secs=300 rate=2 next="" verdict
+  local cap=0 req=150 secs=300 rate=2 next="" verdict offline=0
   while [ $# -gt 0 ]; do
     case "$1" in
+      --offline) offline=1 ;;
       --capture) shift; cap="${1:-25}" ;;
       --max-requests) shift; req="${1:-150}" ;;
       --max-seconds) shift; secs="${1:-300}" ;;
       --rate) shift; rate="${1:-2}" ;;
-      *) die "unknown check option: $1 (use --capture N --max-requests R --max-seconds S --rate RPS)" ;;
+      *) die "unknown check option: $1 (use --offline | --capture N --max-requests R --max-seconds S --rate RPS)" ;;
     esac
     shift
   done
@@ -263,13 +265,17 @@ cmd_check() {
   fi
   if [ -z "$next" ]; then
     say "== 4/7 re-verify existing captured transactions (read-only)"
-    cmd_verify_decoders | tee "$RUN/verify-existing.log" | sed -n '1,40p'
+    rm -f "$RUN/capture.log"
+    cmd_verify_decoders | tee "$RUN/verify-existing.log" | sed -n '1,60p'
   fi
   local providers=0
   if [ -z "$next" ]; then
     say "== 5/7 provider diagnostics"
     (cd "$CORE" && "$BIN" endpoints) | while IFS= read -r l; do say "        $l"; done || true
-    if has_live_urls; then
+    if [ "$offline" = 1 ]; then
+      say "--offline: no provider requests made (existing captures were re-verified above)"
+      [ "$cap" -gt 0 ] 2>/dev/null && { say "--offline overrides --capture"; cap=0; }
+    elif has_live_urls; then
       providers=1
       cmd_doctor 15 | tee "$RUN/doctor.log" | grep -E "^(WS|RPC|JUP|PumpSwap|recommended|PROBLEM|READY|NEXT)|REJECTED|accepted" || true
     else
@@ -288,13 +294,16 @@ cmd_check() {
   fi
   if [ -z "$next" ]; then
     say "== 7/7 final verification report"
-    cmd_verify_decoders > "$RUN/verify-final.log" 2>&1 || true
-    grep -E "^(DECODER|  [a-z_]+ +[A-Z_]+|VENUES|report:)" "$RUN/verify-final.log" || cat "$RUN/verify-final.log"
-    verdict="$(grep '^VENUES MAINNET-VERIFIED' "$RUN/verify-final.log" || true)"
+    local final="$RUN/verify-existing.log"
+    [ -s "$RUN/capture.log" ] && [ "$cap" -gt 0 ] 2>/dev/null && grep -q '^DECODER VERIFICATION' "$RUN/capture.log" && final="$RUN/capture.log"
+    grep -E "^(DECODER|  [a-z_]+ +[A-Z_]+ |VENUES|report:)" "$final" || cat "$final"
+    verdict="$(grep '^VENUES MAINNET-VERIFIED' "$final" || true)"
     case "$verdict" in
       *"pump_bonding_curve=YES"*"pumpswap=YES"*) next="Both venues mainnet-verified. Run: ./scripts/sniper start live --profile main (dashboard http://127.0.0.1:3000; PAPER only)" ;;
       *"YES"*) next="Only some venues are mainnet-verified (see above): fills on the others stay UNVERIFIED. Inspect reports/verification/verification-detail.json for the remaining failures, or capture more with: ./scripts/sniper check --capture 25" ;;
-      *) if [ "$providers" = 1 ]; then
+      *) if [ "$offline" = 1 ]; then
+           next="Review the BEFORE → AFTER lines above (details: reports/verification/comparison-*.json, verification-detail.json). More real evidence (needs ≥5 fully verified trades incl. buys and sells, and PumpSwap samples): ./scripts/sniper check --capture 25 --max-requests 150 --max-seconds 300"
+         elif [ "$providers" = 1 ]; then
            next="No venue is mainnet-verified yet. Read the failed/inconclusive checks above (details: reports/verification/verification-detail.json); collect more evidence with: ./scripts/sniper check --capture 25 --max-requests 150 --max-seconds 300"
          else
            next="Add your provider URLs to $ROOT/.env (SOLANA_WS_URLS=wss://…, optional SOLANA_RPC_URLS=https://…), then: ./scripts/sniper check --capture 25"

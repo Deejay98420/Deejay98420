@@ -59,6 +59,10 @@ enum Cmd {
     GenFixtures {
         #[arg(long, default_value = "../fixtures/synthetic")]
         out: PathBuf,
+        /// replace an existing file whose content differs (default: never; the new file is written
+        /// next to it as hybrid_session.generated.jsonl)
+        #[arg(long)]
+        force: bool,
     },
     /// Connect to the configured live providers for N seconds (memory store, no trading decisions are
     /// persisted) and write a validation report: connectivity, decode coverage, latency, feed health.
@@ -152,12 +156,24 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::GenFixtures { out } => {
+        Cmd::GenFixtures { out, force } => {
             std::fs::create_dir_all(&out)?;
             let p = out.join("hybrid_session.jsonl"); // synthetic fixtures live in fixtures/synthetic
             let msgs = sniper_core::fixtures::hybrid_session();
-            std::fs::write(&p, sniper_core::fixtures::to_jsonl(&msgs))?;
-            println!("wrote {} synthetic messages to {}", msgs.len(), p.display());
+            let text = sniper_core::fixtures::to_jsonl(&msgs);
+            match std::fs::read_to_string(&p) {
+                Ok(existing) if existing == text => println!("{} is up to date ({} synthetic messages)", p.display(), msgs.len()),
+                Ok(_) if !force => {
+                    // never overwrite the tracked fixture silently
+                    let g = out.join("hybrid_session.generated.jsonl");
+                    std::fs::write(&g, &text)?;
+                    println!("{} differs from the generator and was left unchanged; new output written to {} (use --force to replace)", p.display(), g.display());
+                }
+                _ => {
+                    std::fs::write(&p, &text)?;
+                    println!("wrote {} synthetic messages to {}", msgs.len(), p.display());
+                }
+            }
             Ok(())
         }
         Cmd::Migrate => {
@@ -840,6 +856,19 @@ fn verify_fixtures(dir: &std::path::Path, report_dir: &std::path::Path, min_even
     }
     let summary = sniper_core::verify::summarize(&results, min_events);
     std::fs::create_dir_all(report_dir)?;
+    // keep the previous reports: copied into history/<ts>/ (never deleted), then compared
+    let prev_summary: Option<serde_json::Value> = std::fs::read_to_string(report_dir.join("verification.json")).ok().and_then(|t| serde_json::from_str(&t).ok());
+    let prev_detail: Option<serde_json::Value> = std::fs::read_to_string(report_dir.join("verification-detail.json")).ok().and_then(|t| serde_json::from_str(&t).ok());
+    let ts = wall_us() / 1_000_000;
+    if prev_summary.is_some() || prev_detail.is_some() {
+        let h = report_dir.join("history").join(ts.to_string());
+        std::fs::create_dir_all(&h)?;
+        for f in ["verification.json", "verification-detail.json"] {
+            if report_dir.join(f).exists() && !h.join(f).exists() {
+                std::fs::copy(report_dir.join(f), h.join(f))?;
+            }
+        }
+    }
     std::fs::write(report_dir.join("verification.json"), serde_json::to_string_pretty(&summary)?)?;
     std::fs::write(report_dir.join("verification-detail.json"), serde_json::to_string_pretty(&results)?)?;
     println!("DECODER VERIFICATION — {} captured mainnet transactions in {} (read-only){}", summary.files, dir.display(), if unreadable > 0 { format!(", {unreadable} unreadable files skipped") } else { String::new() });
@@ -882,12 +911,61 @@ fn verify_fixtures(dir: &std::path::Path, report_dir: &std::path::Path, min_even
             println!("  {:<20} e.g. {}", "", e.chars().take(220).collect::<String>());
         }
     }
+    if let (Some(ps), Some(pd)) = (&prev_summary, &prev_detail) {
+        let cmp = compare_reports(ps, pd, &summary, &results);
+        std::fs::write(report_dir.join(format!("comparison-{ts}.json")), serde_json::to_string_pretty(&cmp)?)?;
+    }
     println!(
         "VENUES MAINNET-VERIFIED (validated P&L allowed): {}",
         summary.venues_mainnet_verified.iter().map(|(k, v)| format!("{k}={}", if *v { "YES" } else { "no" })).collect::<Vec<_>>().join(", ")
     );
     println!("report: {}/verification.json (per-transaction details: verification-detail.json)", report_dir.display());
     Ok(summary)
+}
+
+/// Print and return a before/after comparison against the previous report: per-venue totals, and the
+/// new outcome of every check that previously FAILED or was INCONCLUSIVE.
+fn compare_reports(prev: &serde_json::Value, prev_detail: &serde_json::Value, now: &sniper_core::verify::VerificationSummary, now_detail: &[sniper_core::verify::TxVerification]) -> serde_json::Value {
+    use serde_json::json;
+    let mut venues = serde_json::Map::new();
+    println!("BEFORE → AFTER (previous report kept in history/):");
+    for (venue, r) in &now.venues {
+        if r.status == "disabled" {
+            continue;
+        }
+        let p = &prev["venues"][venue];
+        let g = |k: &str| p[k].as_u64().map(|x| x.to_string()).unwrap_or("?".into());
+        println!(
+            "  {venue:<20} hard checks pass/fail/inconclusive {}/{}/{} → {}/{}/{}; fully verified trades {} → {} ({} buys, {} sells); status {} → {}",
+            g("checks_passed"), g("checks_failed"), g("checks_inconclusive"), r.checks_passed, r.checks_failed, r.checks_inconclusive,
+            g("events_fully_verified"), r.events_fully_verified, r.fully_verified_buys, r.fully_verified_sells,
+            p["status"].as_str().unwrap_or("?"), r.status
+        );
+        venues.insert(venue.clone(), json!({"before": p, "after": r}));
+    }
+    let mut changes = Vec::new();
+    for tx in prev_detail.as_array().into_iter().flatten() {
+        let sig = tx["signature"].as_str().unwrap_or("");
+        let now_tx = now_detail.iter().find(|t| t.signature == sig);
+        for c in tx["checks"].as_array().into_iter().flatten() {
+            let before = c["outcome"].as_str().unwrap_or(if c["ok"].as_bool() == Some(true) { "pass" } else { "fail" });
+            if before == "pass" || c["hard"].as_bool() != Some(true) {
+                continue;
+            }
+            let (name, ev) = (c["name"].as_str().unwrap_or(""), c["event_index"].as_u64().unwrap_or(0) as usize);
+            let after = now_tx.and_then(|t| t.checks.iter().find(|x| x.name == name && x.event_index == ev));
+            let (a_out, a_detail, a_ix) = match after {
+                Some(x) => (format!("{:?}", x.outcome).to_lowercase(), x.detail.clone(), x.instruction.clone().unwrap_or_default()),
+                None => ("not produced".into(), String::new(), String::new()),
+            };
+            println!("    {}… {:<30} {:>12} → {:<12} {}", &sig[..8.min(sig.len())], name, before.to_uppercase(), a_out.to_uppercase(), a_detail.chars().take(170).collect::<String>());
+            changes.push(json!({"signature": sig, "event_index": ev, "check": name, "before": before, "before_detail": c["detail"], "after": a_out, "after_detail": a_detail, "instruction": a_ix}));
+        }
+    }
+    if changes.is_empty() {
+        println!("    (no previously failing or inconclusive checks)");
+    }
+    json!({"venues": venues, "previously_failed_or_inconclusive": changes})
 }
 
 async fn doctor(listen_seconds: u64, out: PathBuf) -> anyhow::Result<()> {

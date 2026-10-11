@@ -139,6 +139,10 @@ pub struct Provenance {
     pub inner_pos: Option<u16>,
     /// Call depth of the emitting program (log channel) or of the self-CPI (cpi channel).
     pub stack_height: Option<u8>,
+    /// Which invocation of the emitting program (0-based, self-CPIs excluded) within the top-level
+    /// instruction emitted the event, from the log invoke records. None when logs were truncated.
+    #[serde(default)]
+    pub invoke_ordinal: Option<u16>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -199,6 +203,10 @@ pub fn decode_raw(raw: &RawEvent) -> DecodeOutcome {
     }
     let b64 = base64::engine::general_purpose::STANDARD;
     let mut stack: Vec<String> = Vec::new();
+    // invocation ordinal of each frame (per program within the current top-level instruction)
+    let mut frame_ord: Vec<Option<u16>> = Vec::new();
+    let mut invocations: std::collections::HashMap<String, u16> = Default::default();
+    let truncated = raw.logs.iter().any(|l| l.starts_with("Log truncated"));
     let mut idx: u16 = 0;
     let mut outer: Option<u16> = None;
     // (venue, payload) of each log-channel event, aligned with out.events; None for ray_log
@@ -213,7 +221,8 @@ pub fn decode_raw(raw: &RawEvent) -> DecodeOutcome {
                         if let Some((disc, body)) = anchor::split_log_event(&bytes) {
                             match decode_anchor(venue, disc, body) {
                                 Ok(Some(ev)) => {
-                                    let provenance = Provenance { channel: "log".into(), outer_ix: outer, inner_pos: None, stack_height: Some(stack.len().min(255) as u8) };
+                                    let invoke_ordinal = if truncated { None } else { frame_ord.last().copied().flatten() };
+                                    let provenance = Provenance { channel: "log".into(), outer_ix: outer, inner_pos: None, stack_height: Some(stack.len().min(255) as u8), invoke_ordinal };
                                     out.events.push(Decoded { index: idx, event: ev, provenance });
                                     log_keys.push(Some((venue, bytes.clone())));
                                 }
@@ -233,7 +242,7 @@ pub fn decode_raw(raw: &RawEvent) -> DecodeOutcome {
                         match b64.decode(payload.trim()) {
                             Ok(bytes) => match raydium_v4::decode(&bytes) {
                                 Ok(l) => {
-                                    let provenance = Provenance { channel: "log".into(), outer_ix: outer, inner_pos: None, stack_height: Some(stack.len().min(255) as u8) };
+                                    let provenance = Provenance { channel: "log".into(), outer_ix: outer, inner_pos: None, stack_height: Some(stack.len().min(255) as u8), invoke_ordinal: None };
                                     out.events.push(Decoded { index: idx, event: VenueEvent::Raydium(l), provenance });
                                     log_keys.push(None);
                                 }
@@ -253,10 +262,21 @@ pub fn decode_raw(raw: &RawEvent) -> DecodeOutcome {
             if tail.starts_with("invoke [") {
                 if tail == "invoke [1]" {
                     outer = Some(outer.map(|o| o + 1).unwrap_or(0));
+                    invocations.clear();
                 }
+                // a program invoking itself is the Anchor event self-CPI: it belongs to the caller's frame
+                let ord = if stack.last().map(|s| s.as_str()) == Some(id) {
+                    frame_ord.last().copied().flatten()
+                } else {
+                    let n = invocations.entry(id.to_string()).or_insert(0);
+                    *n += 1;
+                    Some(*n - 1)
+                };
                 stack.push(id.to_string());
+                frame_ord.push(ord);
             } else if tail == "success" || tail.starts_with("failed") {
                 stack.pop();
+                frame_ord.pop();
             }
         } else if line.starts_with("Log truncated") {
             out.warnings.push("log truncated by validator; events may be missing".into());
@@ -291,7 +311,7 @@ pub fn decode_raw(raw: &RawEvent) -> DecodeOutcome {
         }
         match decode_anchor(venue, disc, body) {
             Ok(Some(ev)) => {
-                let provenance = Provenance { channel: "cpi".into(), outer_ix: ix.outer_index, inner_pos: ix.position, stack_height: ix.stack_height };
+                let provenance = Provenance { channel: "cpi".into(), outer_ix: ix.outer_index, inner_pos: ix.position, stack_height: ix.stack_height, invoke_ordinal: None };
                 out.events.push(Decoded { index: 1000 + idx, event: ev, provenance });
             }
             Ok(None) => {}

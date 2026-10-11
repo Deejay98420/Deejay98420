@@ -6,3 +6,4 @@ dashboard/.next/
 *.log
 *.tsbuildinfo
 reports/
+fixtures/synthetic/hybrid_session.generated.jsonl

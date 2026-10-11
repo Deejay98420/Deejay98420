@@ -112,7 +112,36 @@ pub struct TxModel {
     /// Token accounts touched by parsed token instructions that change balances without a transfer
     /// (syncNative, unrecognised token instructions): their deltas cannot be fully explained.
     pub unexplained_token_accounts: Vec<String>,
+    /// token accounts closed by a parsed closeAccount, with their balance at that moment
+    pub closed_accounts: Vec<ClosedAccount>,
     pub log_messages: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ClosedAccount {
+    pub account: String,
+    pub ix: usize,
+    pub balance_at_close: i128,
+}
+
+/// Net parsed token flow of `acct` over the flows collected so far (all earlier instructions).
+fn flow_sum_before(flows: &[Flow], acct: &str) -> i128 {
+    flows
+        .iter()
+        .map(|f| match f {
+            Flow::Token { from, to, amount, .. } => {
+                let mut v = 0;
+                if to.as_deref() == Some(acct) {
+                    v += amount;
+                }
+                if from.as_deref() == Some(acct) {
+                    v -= amount;
+                }
+                v
+            }
+            _ => 0,
+        })
+        .sum()
 }
 
 fn b58_or_str(k: &Value) -> Option<String> {
@@ -244,6 +273,7 @@ impl TxModel {
             inner_stack_heights: stack_heights,
             flows: vec![],
             unexplained_token_accounts: vec![],
+            closed_accounts: vec![],
             log_messages: meta["logMessages"].as_array().map(|a| a.iter().filter_map(|l| l.as_str().map(String::from)).collect()).unwrap_or_default(),
         };
         m.collect_flows();
@@ -257,6 +287,7 @@ impl TxModel {
     fn collect_flows(&mut self) {
         let mut flows = Vec::new();
         let mut unexplained = Vec::new();
+        let mut closed = Vec::new();
         for (i, ix) in self.ixs.iter().enumerate() {
             let (Some(prog), Some(ty)) = (ix.parsed_program.as_deref(), ix.parsed_type.as_deref()) else { continue };
             let info = &ix.info;
@@ -289,9 +320,16 @@ impl TxModel {
                     "syncNative" => unexplained.extend(s("account")),
                     // no token balance change: account setup / authority / metadata
                     "closeAccount" => {
-                        // a native (WSOL) account can be closed with a non-zero token amount
-                        if let Some(a) = s("account").filter(|a| self.tokens.get(a).and_then(|t| t.pre).unwrap_or(0) != 0) {
-                            unexplained.push(a);
+                        // SPL Token only closes an account whose balance is zero AT THAT POINT (native WSOL
+                        // accounts excepted). The balance at close = pre balance + parsed flows before it.
+                        // Closing never burns tokens by itself.
+                        if let Some(a) = s("account") {
+                            let pre = self.tokens.get(&a).and_then(|t| t.pre).unwrap_or(0);
+                            let at_close = pre + flow_sum_before(&flows, &a);
+                            closed.push(ClosedAccount { account: a.clone(), ix: i, balance_at_close: at_close });
+                            if at_close != 0 {
+                                unexplained.push(a);
+                            }
                         }
                     }
                     "initializeAccount" | "initializeAccount2" | "initializeAccount3" | "initializeImmutableOwner" | "approve" | "approveChecked" | "revoke"
@@ -321,6 +359,7 @@ impl TxModel {
             }
         }
         self.flows = flows;
+        self.closed_accounts = closed;
         unexplained.sort();
         unexplained.dedup();
         self.unexplained_token_accounts = unexplained;
@@ -416,6 +455,38 @@ impl TxModel {
     pub fn transfers_in(&self, i: usize) -> Option<Vec<&Flow>> {
         let r = self.subtree(i)?;
         Some(self.flows.iter().filter(|f| matches!(f, Flow::Token { ix, .. } if r.contains(ix))).collect())
+    }
+
+    /// Instruction indices that name `acct`, in their account list or (parsed instructions) their info.
+    pub fn referencing(&self, acct: &str) -> Vec<usize> {
+        self.ixs
+            .iter()
+            .enumerate()
+            .filter(|(_, ix)| ix.accounts.iter().any(|a| a == acct) || ix.info.as_object().is_some_and(|o| o.values().any(|v| v.as_str() == Some(acct))))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Lamport flows (parsed System transfers / account creation) into `acct` inside `range`.
+    pub fn lamport_credits_in(&self, acct: &str, range: &std::ops::Range<usize>) -> Vec<(usize, i128)> {
+        self.flows
+            .iter()
+            .filter_map(|f| match f {
+                Flow::Lamports { ix, to, amount, .. } if to == acct && range.contains(ix) => Some((*ix, *amount)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Human-readable instruction reference: "ix 3" or "ix 3.2".
+    pub fn ix_ref(&self, i: usize) -> String {
+        match self.ixs.get(i) {
+            Some(ix) => match ix.inner_pos {
+                Some(p) => format!("ix {}.{}", ix.outer, p),
+                None => format!("ix {}", ix.outer),
+            },
+            None => "ix ?".into(),
+        }
     }
 
     /// Base64 of an instruction's raw data (for logs / reports).

@@ -1,4 +1,4 @@
-# pandarianz-solana-hybrid-sniper (v1.2.1)
+# pandarianz-solana-hybrid-sniper (v1.2.2)
 
 A **PAPER-ONLY** Solana memecoin launch sniper and momentum trader. It has an event-driven Rust core, PostgreSQL persistence with a replayable journal, and a read-only Next.js dashboard.
 
@@ -88,6 +88,15 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the modules and [docs/ASSUM
 6. Optional bounded mainnet capture (`--capture N`): stops at the target, the request budget or the time limit.
 7. Final verification report per venue (`reports/verification/`), then the **single next required action**.
 
+## V1.2.2: evidence-based repair (from the forensic audit of 15 real captures)
+
+- **Split protocol fees.** The six fee "failures" were a second recipient sharing the decoded fee. All four observed second accounts are in the official `Global.buybackFeeRecipients` list (`@pump-fun/pump-sdk@4.0.0` `bondingCurve.ts`, recorded with sha256 in `fixtures/idl/pump.fee-recipients.json`), and the SDK passes that account as a remaining account of legacy `buy`/`sell`. The check now sums the credits of every recipient bound to the trade instruction (its `fee_recipient` plus an official buyback recipient among its accounts) and requires the exact decoded total — no 50/50 split is assumed; odd lamports need no special case. Evidence must be parsed System transfers inside that instruction, or balance deltas of accounts no other instruction names; balance-only evidence through a wrapper (`5guPtRHy…`) stays **INCONCLUSIVE**. Parsed credits must also agree with the balance of any account only that instruction touches.
+- **Creator fee.** The creator-fee transfer inside the trade instruction is compared with the decoded creator fee; other transfers into the vault (e.g. 650,240 lamports in `3R1MvPxv…`) are recorded as notes ("purpose not established, not counted as fee"). If no transfer equals the decoded fee it is a FAIL.
+- **Instruction matching.** Events are tied to their emitting instruction exactly: the self-CPI's parent one call level up, or the n-th invocation of the program in the log invoke records — so Pump.fun trades called through another program's CPI are matched. `buy_exact_quote_in_v3` was added from the IDL. An unrecognized discriminator stays INCONCLUSIVE and its hex is reported.
+- **Token-account lifecycle.** A `closeAccount` is checked against the account's running balance at that moment (pre balance + parsed movements before it); closing never counts as a burn. Accounts missing from post balances are treated as closed only with that evidence; otherwise INCONCLUSIVE.
+- **Every check names its instruction** (`instruction: "ix 3.0 buy (6EF8rr)"`). `verify-fixtures` copies the previous report into `reports/verification/history/<ts>/` and prints **BEFORE → AFTER** totals and the new outcome of every previously failing or inconclusive check (`comparison-<ts>.json`).
+- `setup` no longer rewrites the tracked synthetic fixture; `gen-fixtures` writes `hybrid_session.generated.jsonl` instead of overwriting a differing file (use `--force` to replace).
+
 ## V1.2.1: mainnet repair
 
 Fixes for the defects found on the first real mainnet run:
@@ -170,7 +179,7 @@ The IDL check found and fixed real issues relative to v1.0:
 
 ## Tests
 
-`./scripts/sniper test` runs 116 tests, plus the static check and the dashboard typecheck/build. V1.2.1 adds:
+`./scripts/sniper test` runs 125 tests, plus the static check and the dashboard typecheck/build. V1.2.2 adds `v122_audit_replay` (9): reconstructions of the audited structures using the audit's amounts and accounts — the five parsed fee splits (incl. 4,692 + 4,691), a non-official second account (FAIL), balance-only split through a wrapper (INCONCLUSIVE) vs. top-level (PASS), creator vault with 650,240 extra funding, nested CPI matching via self-CPI and via log order, unrecognized discriminator, sells closing the token account (incl. closing a non-empty account → INCONCLUSIVE), the venue rule, and the before/after report. These are synthetic reconstructions; mainnet status comes only from `fixtures/real`. V1.2.1 added:
 
 - `v121_mainnet_repair` (18): IDL instruction-layout provenance; version 0/1/legacy transactions and lookup-table accounts; structural validation; log+CPI duplicate merge (the doubled-amount regression); repeated genuine trades in one transaction; token creation in conservation; fee reconciliation (observed transfers and SDK formula); missing evidence → inconclusive, never verified; wrong direction; HTTP 429 with `Retry-After`; bounded retries; `-32015` classification; bounded queue; request budget and wait limit; in-flight dedupe; placeholder endpoints; `capture` under 429 pressure stopping cleanly within its budget.
 - `v12_evidence` and `real_fixtures` rewritten on realistic synthetic transactions (`txbuild.rs`: instruction tree, parsed transfers, double emission); `real_fixtures` re-verifies `fixtures/real/` read-only (hashes before/after).

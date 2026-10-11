@@ -49,6 +49,9 @@ pub struct Check {
     pub ok: bool,
     pub hard: bool,
     pub detail: String,
+    /// emitting instruction of the event this check belongs to ("ix 3.1 buy")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -82,6 +85,9 @@ pub struct TxVerification {
     pub fee_hypotheses: Vec<String>,
     #[serde(default)]
     pub tx_failed: bool,
+    /// observations that are recorded but not counted as checks (e.g. extra vault funding)
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 impl TxVerification {
@@ -144,53 +150,237 @@ fn event_program(e: &VenueEvent) -> &'static str {
 /// Instruction an event was emitted by: (ix index, layout) or the reason it cannot be determined.
 type Mapping = Result<(usize, &'static IxDef), String>;
 
+fn hex8(d: [u8; 8]) -> String {
+    d.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn is_event_cpi(ix: &crate::txmodel::Ix) -> bool {
+    ix.data.as_ref().is_some_and(|d| d.len() >= 8 && d[..8] == EVENT_IX_TAG)
+}
+
+/// Resolve the emitting instruction of one event:
+/// 1. self-CPI channel: the event's inner instruction is a child of the emitting instruction, so the
+///    parent is the nearest preceding instruction one call level up (exact, works at any CPI depth);
+/// 2. log channel: the n-th invocation of the program inside the top-level instruction (from the
+///    log invoke records, self-CPIs excluded) is the n-th instruction of that program in the
+///    instruction tree.
+fn map_one(m: &TxModel, d: &crate::decode::Decoded) -> Mapping {
+    let Some(class) = event_class(&d.event) else { return Err("event type is not tied to an instruction".into()) };
+    let program = event_program(&d.event);
+    let Some(o) = d.provenance.outer_ix else { return Err("no instruction provenance (logs without invoke records)".into()) };
+    let group: Vec<usize> = (0..m.ixs.len()).filter(|&i| m.ixs[i].outer == o).collect();
+    let parent = d.provenance.inner_pos.and_then(|p| {
+        let e = group.iter().copied().find(|&i| m.ixs[i].inner_pos == Some(p))?;
+        let h = m.ixs[e].stack_height.filter(|h| *h >= 2)?;
+        group.iter().copied().filter(|&i| i < e).rev().find(|&i| m.ixs[i].stack_height == Some(h - 1))
+    });
+    let (i, via) = if let Some(pi) = parent {
+        (pi, "self-CPI parent")
+    } else if let Some(n) = d.provenance.invoke_ordinal {
+        let calls: Vec<usize> = group.iter().copied().filter(|&i| m.ixs[i].program_id == program && !is_event_cpi(&m.ixs[i])).collect();
+        match calls.get(n as usize) {
+            Some(&i) => (i, "log invoke order"),
+            None => return Err(format!("log invoke #{n} of the program has no matching instruction in top-level instruction {o}")),
+        }
+    } else {
+        return Err("neither a self-CPI position (with call depth) nor a log invoke order is available".into());
+    };
+    let ix = &m.ixs[i];
+    if ix.program_id != program {
+        return Err(format!("{via} resolved to {} of another program ({})", m.ix_ref(i), short(&ix.program_id)));
+    }
+    let Some(disc) = ix.disc() else { return Err(format!("{} has no instruction data", m.ix_ref(i))) };
+    let Some(def) = ixlayout::lookup(program, disc) else {
+        return Err(format!("{} ({via}): unrecognized instruction discriminator {} — not in the official IDL subset", m.ix_ref(i), hex8(disc)));
+    };
+    match ix_class(program, &def.name) {
+        Some(c) if c == class => Ok((i, def)),
+        Some("pump_trade_multi") => Err(format!("{} multi_hop_curve_swap emits several trades per instruction; per-trade accounts are not in the instruction", m.ix_ref(i))),
+        _ => Err(format!("{} ({via}) is `{}`, not an instruction of class {class}", m.ix_ref(i), def.name)),
+    }
+}
+
 fn map_events(m: &TxModel, events: &[crate::decode::Decoded]) -> Vec<Mapping> {
-    // venue instructions with a known layout (event self-CPIs excluded), grouped by (outer, class)
-    let mut groups: HashMap<(u16, &'static str), Vec<(usize, &'static IxDef)>> = HashMap::new();
-    let mut multi: HashSet<u16> = HashSet::new();
-    for (i, ix) in m.ixs.iter().enumerate() {
-        let Some(d) = ix.data.as_ref() else { continue };
-        if d.len() >= 8 && d[..8] == EVENT_IX_TAG {
-            continue;
-        }
-        let Some(def) = ix.disc().and_then(|disc| ixlayout::lookup(&ix.program_id, disc)) else { continue };
-        let Some(class) = ix_class(&ix.program_id, &def.name) else { continue };
-        if class == "pump_trade_multi" {
-            multi.insert(ix.outer);
-            continue;
-        }
-        groups.entry((ix.outer, class)).or_default().push((i, def));
-    }
-    let mut ev_groups: HashMap<(u16, &'static str), Vec<usize>> = HashMap::new();
-    let mut out: Vec<Mapping> = vec![Err("event type is not tied to an instruction".into()); events.len()];
-    for (k, d) in events.iter().enumerate() {
-        let Some(class) = event_class(&d.event) else { continue };
-        match d.provenance.outer_ix {
-            Some(o) => ev_groups.entry((o, class)).or_default().push(k),
-            None => out[k] = Err("no instruction provenance (logs without invoke records)".into()),
+    let mut out: Vec<Mapping> = events.iter().map(|d| map_one(m, d)).collect();
+    // one instruction emits one event of its class; anything else is ambiguous
+    let mut used: HashMap<(usize, &'static str), Vec<usize>> = HashMap::new();
+    for (k, r) in out.iter().enumerate() {
+        if let (Ok((i, _)), Some(c)) = (r, event_class(&events[k].event)) {
+            used.entry((*i, c)).or_default().push(k);
         }
     }
-    for (key, evs) in ev_groups {
-        let ixs = groups.get(&key).cloned().unwrap_or_default();
-        let ixs: Vec<_> = ixs.into_iter().filter(|(_, def)| !def.name.is_empty()).collect();
-        if key.1 == "pump_trade" && multi.contains(&key.0) {
-            for k in evs {
-                out[k] = Err("multi_hop_curve_swap emits several trades per instruction; per-trade accounts are not in the instruction".into());
+    for ((i, _), ks) in used {
+        if ks.len() > 1 {
+            for k in ks.iter() {
+                out[*k] = Err(format!("{} events attributed to the same instruction {}", ks.len(), m.ix_ref(i)));
             }
-            continue;
-        }
-        let same_program = |k: usize| ixs.iter().all(|(i, _)| m.ixs[*i].program_id == event_program(&events[k].event));
-        if ixs.len() != evs.len() || !evs.iter().all(|k| same_program(*k)) {
-            for k in &evs {
-                out[*k] = Err(format!("{} {} event(s) vs {} matching instruction(s) in top-level instruction {}", evs.len(), key.1, ixs.len(), key.0));
-            }
-            continue;
-        }
-        for (k, ix) in evs.into_iter().zip(ixs) {
-            out[k] = Ok(ix);
         }
     }
     out
+}
+
+/// Official Pump.fun fee-recipient lists (pump-sdk bondingCurve.ts, with provenance).
+pub const PUMP_FEE_RECIPIENTS: &str = include_str!("../../fixtures/idl/pump.fee-recipients.json");
+
+fn buyback_recipients() -> &'static Vec<String> {
+    static L: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    L.get_or_init(|| {
+        let v: Value = serde_json::from_str(PUMP_FEE_RECIPIENTS).expect("bundled fee recipient JSON");
+        v["buyback_fee_recipients"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default()
+    })
+}
+
+/// Lamport credit evidence for one account relative to one trade instruction.
+struct Credit {
+    /// parsed System transfers into the account inside the instruction's subtree
+    parsed: Vec<(usize, i128)>,
+    balance: Option<i128>,
+    /// instructions outside the trade instruction (and its CPIs) that name the account
+    others: Vec<usize>,
+}
+
+fn credit(m: &TxModel, acct: &str, ix: usize, sub: &std::ops::Range<usize>) -> Credit {
+    Credit {
+        parsed: m.lamport_credits_in(acct, sub),
+        balance: m.lamport_delta(acct),
+        others: m.referencing(acct).into_iter().filter(|r| *r != ix && !sub.contains(r)).collect(),
+    }
+}
+
+fn refs(m: &TxModel, v: &[usize]) -> String {
+    v.iter().map(|i| m.ix_ref(*i)).collect::<Vec<_>>().join(", ")
+}
+
+/// Protocol fee: every recipient bound to the trade instruction (its `fee_recipient` account and any
+/// buyback recipient — an instruction account, or a remaining account listed in the official
+/// `Global.buybackFeeRecipients`) is credited inside that instruction; the credits must add up to
+/// the decoded fee exactly. Evidence: parsed System transfers inside the instruction, or — when there
+/// are none (sells pay from the program-owned curve) — balance deltas of accounts no other
+/// instruction names. Anything weaker is inconclusive.
+#[allow(clippy::too_many_arguments)]
+fn fee_route_check(m: &TxModel, o: &mut Out, i: usize, ix: usize, def: &IxDef, t: &crate::decode::pumpfun::PumpTrade, notes: &mut Vec<String>, routes: &mut Vec<String>) {
+    let accts = &m.ixs[ix].accounts;
+    let name = &def.name;
+    let Some(sub) = m.subtree(ix) else {
+        return o.add(i, "trade.protocol_fee_observed", Outcome::Inconclusive, true, format!("{}: call depth unavailable", m.ix_ref(ix)));
+    };
+    let Some(fr) = def.get(accts, "fee_recipient") else {
+        return o.add(i, "trade.protocol_fee_observed", Outcome::Inconclusive, true, format!("{name}: no fee_recipient account in this instruction layout"));
+    };
+    let mut recips: Vec<(String, String)> = vec![("fee_recipient".into(), fr.to_string())];
+    if let Some(bb) = def.get(accts, "buyback_fee_recipient") {
+        recips.push(("buyback_fee_recipient (instruction account)".into(), bb.to_string()));
+    }
+    for (k, a) in accts.iter().enumerate().skip(def.accounts.len()) {
+        if buyback_recipients().contains(a) && !recips.iter().any(|r| &r.1 == a) {
+            recips.push((format!("buyback recipient (remaining account #{}, official Global.buybackFeeRecipients)", k - def.accounts.len()), a.clone()));
+        }
+    }
+    let fee = t.fee.unwrap_or(0) as i128;
+    let credits: Vec<Credit> = recips.iter().map(|(_, a)| credit(m, a, ix, &sub)).collect();
+    let parsed_total: i128 = credits.iter().flat_map(|c| c.parsed.iter().map(|x| x.1)).sum();
+    let any_parsed = credits.iter().any(|c| !c.parsed.is_empty());
+    let exclusive = credits.iter().all(|c| c.others.is_empty() && c.balance.is_some());
+    let bal: i128 = credits.iter().map(|c| c.balance.unwrap_or(0)).sum();
+    let split = |parsed: bool| {
+        recips
+            .iter()
+            .zip(&credits)
+            .map(|((l, a), c)| format!("{l} {}: {}", short(a), if parsed { c.parsed.iter().map(|x| x.1).sum::<i128>() } else { c.balance.unwrap_or(0) }))
+            .collect::<Vec<_>>()
+            .join(" + ")
+    };
+    let here = format!("{} {name}", m.ix_ref(ix));
+    let others: Vec<usize> = credits.iter().flat_map(|c| c.others.clone()).collect();
+    if let Some(tail) = t.tail.as_ref() {
+        if recips.len() > 1 {
+            let bb_obs: i128 = credits[1..].iter().map(|c| if c.parsed.is_empty() { c.balance.unwrap_or(0) } else { c.parsed.iter().map(|x| x.1).sum() }).sum();
+            o.add(i, "trade.buyback_fee_field", Outcome::Pass, false, format!("event buyback_fee {} ({} bps) vs buyback recipient credit {bb_obs} (information only)", tail.buyback_fee, tail.buyback_fee_basis_points));
+        }
+    }
+    // parsed credits must also agree with the balance change of any recipient no other instruction names
+    let inconsistent: Vec<String> = recips
+        .iter()
+        .zip(&credits)
+        .filter(|(_, c)| c.others.is_empty() && !c.parsed.is_empty() && c.balance.is_some_and(|b| b != c.parsed.iter().map(|x| x.1).sum::<i128>()))
+        .map(|((l, a), c)| format!("{l} {}: parsed {} vs balance delta {:?}", short(a), c.parsed.iter().map(|x| x.1).sum::<i128>(), c.balance))
+        .collect();
+    let (outcome, detail, route) = if !inconsistent.is_empty() {
+        (Outcome::Fail, format!("parsed transfers disagree with balance evidence: {}", inconsistent.join("; ")), String::new())
+    } else if any_parsed && parsed_total == fee {
+        (Outcome::Pass, format!("decoded fee {fee} = {} [parsed System transfers inside {here}]", split(true)), format!("{}_recipient(s):parsed_transfers", recips.len()))
+    } else if exclusive && bal == fee {
+        (Outcome::Pass, format!("decoded fee {fee} = {} [balance deltas; accounts named only by {here}]", split(false)), format!("{}_recipient(s):exclusive_balance", recips.len()))
+    } else if any_parsed && (parsed_total > fee || exclusive) {
+        (Outcome::Fail, format!("decoded fee {fee} vs parsed credits {parsed_total} = {} inside {here}", split(true)), String::new())
+    } else if exclusive {
+        (Outcome::Fail, format!("decoded fee {fee} vs balance deltas {bal} = {} (accounts named only by {here})", split(false)), String::new())
+    } else {
+        (
+            Outcome::Inconclusive,
+            format!(
+                "balance-only evidence: {} = {bal} ({} decoded fee {fee}), but the accounts are also named by {} — credit cannot be attributed to {here}",
+                split(false),
+                if bal == fee { "equals" } else { "differs from" },
+                refs(m, &others)
+            ),
+            String::new(),
+        )
+    };
+    if !route.is_empty() {
+        routes.push(route);
+    }
+    if outcome != Outcome::Pass && recips.len() == 1 {
+        notes.push(format!("{here}: no buyback recipient found among the instruction's remaining accounts"));
+    }
+    o.add(i, "trade.protocol_fee_observed", outcome, true, detail);
+}
+
+/// Creator fee: the creator-fee credit inside the trade instruction is compared with the decoded
+/// creator fee; other transfers into the vault are reported separately (never counted as fee).
+#[allow(clippy::too_many_arguments)]
+fn creator_fee_check(m: &TxModel, o: &mut Out, i: usize, ix: usize, def: &IxDef, t: &crate::decode::pumpfun::PumpTrade, notes: &mut Vec<String>) {
+    let accts = &m.ixs[ix].accounts;
+    let name = &def.name;
+    let Some(cv) = def.get(accts, "creator_vault") else {
+        return o.add(i, "trade.creator_fee_observed", Outcome::Inconclusive, true, format!("{name}: no creator_vault account in this instruction layout"));
+    };
+    let Some(sub) = m.subtree(ix) else {
+        return o.add(i, "trade.creator_fee_observed", Outcome::Inconclusive, true, format!("{}: call depth unavailable", m.ix_ref(ix)));
+    };
+    let creator_set = t.creator.is_some_and(|c| c != Pubkey::default());
+    let expected = if creator_set { t.creator_fee.unwrap_or(0) as i128 } else { 0 };
+    let cashback = t.tail.as_ref().is_some_and(|x| x.cashback > 0);
+    let c = credit(m, cv, ix, &sub);
+    let here = format!("{} {name}", m.ix_ref(ix));
+    let total: i128 = c.parsed.iter().map(|x| x.1).sum();
+    let (outcome, detail) = if !c.parsed.is_empty() && c.others.is_empty() && c.balance.is_some_and(|b| b != total) {
+        (Outcome::Fail, format!("creator vault {}: parsed credits {total} disagree with balance delta {:?}", short(cv), c.balance))
+    } else if !c.parsed.is_empty() {
+        if total == expected {
+            (Outcome::Pass, format!("creator vault {}: parsed credits {total} = decoded creator fee {expected} inside {here}", short(cv)))
+        } else if let Some(pos) = c.parsed.iter().position(|x| x.1 == expected).filter(|_| expected > 0) {
+            let extra: Vec<String> = c.parsed.iter().enumerate().filter(|(k, _)| *k != pos).map(|(_, (ix2, a))| format!("{a} lamports ({})", m.ix_ref(*ix2))).collect();
+            notes.push(format!("{here}: creator vault {} received additional funding {} besides the creator fee — purpose not established, not counted as fee", short(cv), extra.join(", ")));
+            (Outcome::Pass, format!("creator vault {}: creator-fee transfer {expected} ({}) = decoded creator fee; additional vault funding {} tracked separately", short(cv), m.ix_ref(c.parsed[pos].0), extra.join(", ")))
+        } else if cashback {
+            (Outcome::Inconclusive, format!("creator vault {}: parsed credits {total} vs decoded {expected}; cashback coin — routing undocumented", short(cv)))
+        } else {
+            (Outcome::Fail, format!("creator vault {}: parsed credits {:?} inside {here}, none equals decoded creator fee {expected}", short(cv), c.parsed.iter().map(|x| x.1).collect::<Vec<_>>()))
+        }
+    } else if let (true, Some(b)) = (c.others.is_empty(), c.balance) {
+        match (b == expected, cashback) {
+            (true, _) => (Outcome::Pass, format!("creator vault {}: balance delta {b} = decoded creator fee {expected} [account named only by {here}]", short(cv))),
+            (false, true) => (Outcome::Inconclusive, format!("creator vault {}: balance delta {b} vs decoded {expected}; cashback coin — routing undocumented", short(cv))),
+            (false, false) => (Outcome::Fail, format!("creator vault {}: balance delta {b} vs decoded creator fee {expected} (account named only by {here})", short(cv))),
+        }
+    } else {
+        (
+            Outcome::Inconclusive,
+            format!("creator vault {}: balance-only evidence {:?} vs decoded {expected}; account also named by {}", short(cv), c.balance, refs(m, &c.others)),
+        )
+    };
+    o.add(i, "trade.creator_fee_observed", outcome, true, detail);
 }
 
 /// Accumulates expected deltas for an account across events.
@@ -260,7 +450,7 @@ struct Out<'a> {
 
 impl Out<'_> {
     fn add(&mut self, i: usize, name: &str, outcome: Outcome, hard: bool, detail: String) {
-        self.checks.push(Check { event_index: i, name: name.into(), ok: outcome == Outcome::Pass, outcome, hard, detail });
+        self.checks.push(Check { event_index: i, name: name.into(), ok: outcome == Outcome::Pass, outcome, hard, detail, instruction: None });
     }
     fn cmp(&mut self, i: usize, name: &str, observed: Result<i128, String>, expected: i128, what: &str) {
         match observed {
@@ -300,7 +490,7 @@ pub fn verify_tx(rpc_result: &Value, signature: &str) -> TxVerification {
     };
     v.structure_problems = structure_problems(rpc_result);
     let (Some(raw), Some(m)) = (parse_tx_object(rpc_result, Some(signature), v.slot, "verify", Commitment::Confirmed, 0), TxModel::parse(rpc_result, signature)) else {
-        v.checks.push(Check { event_index: 0, name: "parse".into(), outcome: Outcome::Fail, ok: false, hard: true, detail: format!("unparsable transaction: {:?}", v.structure_problems) });
+        v.checks.push(Check { event_index: 0, name: "parse".into(), outcome: Outcome::Fail, ok: false, hard: true, detail: format!("unparsable transaction: {:?}", v.structure_problems), instruction: None });
         return v;
     };
     if m.err.is_some() {
@@ -329,12 +519,10 @@ pub fn verify_tx(rpc_result: &Value, signature: &str) -> TxVerification {
     let mut checks = Vec::new();
     let mut o = Out { checks: &mut checks };
     // aggregated per-account expectations
-    let (mut curve_vault, mut user_ata, mut curve_val, mut fee_val, mut creator_val, mut buyback_val) =
-        (BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+    let (mut curve_vault, mut user_ata, mut curve_val) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
     let (mut pool_base, mut pool_quote, mut swap_user_base, mut amm_proto, mut amm_creator) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
     let mut mints: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     let mut fee_quote_ata: HashMap<String, Option<String>> = HashMap::new();
-    let mut cashback_events: HashSet<usize> = HashSet::new();
     let mut amm_v2_events: HashSet<usize> = HashSet::new();
 
     for (i, d) in events.iter().enumerate() {
@@ -370,9 +558,6 @@ pub fn verify_tx(rpc_result: &Value, signature: &str) -> TxVerification {
                 let mint = t.mint.to_string();
                 mints.entry(mint.clone()).or_default().push(i);
                 let tok = t.token_amount as i128;
-                if t.tail.as_ref().is_some_and(|x| x.cashback > 0) {
-                    cashback_events.insert(i);
-                }
                 let (ix, _def) = match mp {
                     Ok(x) => *x,
                     Err(e) => {
@@ -431,22 +616,9 @@ pub fn verify_tx(rpc_result: &Value, signature: &str) -> TxVerification {
                         add_expect(&mut curve_val, Some(c), if t.is_buy { sol } else { -sol }, i);
                         fee_quote_ata.insert(c.clone(), acct("associated_quote_bonding_curve"));
                     }
-                    if let Some(fr) = acct("fee_recipient") {
-                        add_expect(&mut fee_val, Some(&fr), t.fee.unwrap_or(0) as i128, i);
-                        fee_quote_ata.insert(fr.clone(), acct("associated_quote_fee_recipient"));
-                    } else {
-                        o.add(i, "trade.protocol_fee_observed", Outcome::Inconclusive, true, format!("{ix_name}: no fee_recipient account in this instruction layout"));
-                    }
-                    let creator_set = t.creator.is_some_and(|c| c != Pubkey::default());
-                    if let Some(cv) = acct("creator_vault") {
-                        add_expect(&mut creator_val, Some(&cv), if creator_set { t.creator_fee.unwrap_or(0) as i128 } else { 0 }, i);
-                        fee_quote_ata.insert(cv.clone(), acct("associated_creator_vault"));
-                    } else {
-                        o.add(i, "trade.creator_fee_observed", Outcome::Inconclusive, true, format!("{ix_name}: no creator_vault account in this instruction layout"));
-                    }
-                    if let (Some(bb), Some(tail)) = (acct("buyback_fee_recipient"), t.tail.as_ref()) {
-                        add_expect(&mut buyback_val, Some(&bb), tail.buyback_fee as i128, i);
-                        fee_quote_ata.insert(bb.clone(), acct("associated_quote_buyback_fee_recipient"));
+                    if let Ok((ix, def)) = mp {
+                        fee_route_check(&m, &mut o, i, *ix, def, t, &mut v.notes, &mut v.fee_hypotheses);
+                        creator_fee_check(&m, &mut o, i, *ix, def, t, &mut v.notes);
                     }
                 } else {
                     o.add(i, "trade.sol_amount", Outcome::Inconclusive, true, "non-SOL quote mint: outside trading scope, quote accounting not verified".into());
@@ -594,62 +766,6 @@ pub fn verify_tx(rpc_result: &Value, signature: &str) -> TxVerification {
     }
     o.group("swap.protocol_fee_observed", &amm_proto, |a| ctx.token_net(a), "protocol fee token account");
     o.group("swap.creator_fee_observed", &amm_creator, |a| ctx.token_net(a), "coin creator vault token account");
-    // ---- curve fee routing: test explicit hypotheses against observed transfers ----
-    let obs = |map: &BTreeMap<String, Expect>| -> BTreeMap<String, Result<i128, String>> {
-        map.keys().map(|a| (a.clone(), ctx.value_net(Some(a), fee_quote_ata.get(a).and_then(|x| x.as_deref())))).collect()
-    };
-    let (fee_obs, bb_obs) = (obs(&fee_val), obs(&buyback_val));
-    let bb_total: i128 = buyback_val.values().map(|e| e.expected).sum();
-    let all_eq = |o: &BTreeMap<String, Result<i128, String>>, e: &BTreeMap<String, Expect>, adj: &dyn Fn(&str) -> i128| e.iter().all(|(a, x)| o.get(a).and_then(|r| r.as_ref().ok()) == Some(&(x.expected + adj(a))));
-    let inconclusive_fee = fee_obs.values().chain(bb_obs.values()).find_map(|r| r.as_ref().err().cloned());
-    let shared_roles = fee_val.keys().any(|a| curve_val.contains_key(a) || creator_val.contains_key(a));
-    let hyp: Option<&str> = if fee_val.is_empty() {
-        None
-    } else if bb_total == 0 && all_eq(&fee_obs, &fee_val, &|_| 0) {
-        Some("protocol_fee_to_fee_recipient")
-    } else if bb_total != 0 && all_eq(&fee_obs, &fee_val, &|_| 0) && all_eq(&bb_obs, &buyback_val, &|_| 0) {
-        Some("buyback_fee_additional_to_protocol_fee")
-    } else if bb_total != 0 && fee_val.len() == 1 && all_eq(&fee_obs, &fee_val, &|_| -bb_total) && all_eq(&bb_obs, &buyback_val, &|_| 0) {
-        Some("buyback_fee_carved_from_protocol_fee")
-    } else {
-        None
-    };
-    for (acct, e) in &fee_val {
-        for &i in &e.events {
-            let (outcome, detail) = match (hyp, &inconclusive_fee, shared_roles) {
-                (_, _, true) => (Outcome::Inconclusive, "fee recipient also has another role in this transaction".to_string()),
-                (Some(h), _, _) => (Outcome::Pass, format!("fee recipient {}: observed {:?} matches hypothesis {h}", short(acct), fee_obs[acct].as_ref().ok())),
-                (None, Some(er), _) => (Outcome::Inconclusive, er.clone()),
-                (None, None, _) => (
-                    Outcome::Fail,
-                    format!(
-                        "fee recipient {}: observed {:?} vs decoded fee {} (buyback decoded {bb_total}, buyback observed {:?}); no documented fee-routing hypothesis matches",
-                        short(acct),
-                        fee_obs[acct].as_ref().ok(),
-                        e.expected,
-                        bb_obs.values().filter_map(|r| r.as_ref().ok()).sum::<i128>()
-                    ),
-                ),
-            };
-            o.add(i, "trade.protocol_fee_observed", outcome, true, detail);
-        }
-    }
-    if let Some(h) = hyp {
-        v.fee_hypotheses.push(h.into());
-    }
-    for (acct, e) in &creator_val {
-        let r = ctx.value_net(Some(acct), fee_quote_ata.get(acct).and_then(|x| x.as_deref()));
-        for &i in &e.events {
-            match &r {
-                Ok(x) if *x == e.expected => o.add(i, "trade.creator_fee_observed", Outcome::Pass, true, format!("creator vault {}: observed {x} = decoded {}", short(acct), e.expected)),
-                Ok(x) if e.events.iter().any(|k| cashback_events.contains(k)) => {
-                    o.add(i, "trade.creator_fee_observed", Outcome::Inconclusive, true, format!("creator vault {}: observed {x} vs decoded {}; cashback coin — cashback routing is not documented", short(acct), e.expected))
-                }
-                Ok(x) => o.add(i, "trade.creator_fee_observed", Outcome::Fail, true, format!("creator vault {}: observed {x} vs decoded creator fee {} (diff {})", short(acct), e.expected, x - e.expected)),
-                Err(er) => o.add(i, "trade.creator_fee_observed", Outcome::Inconclusive, true, er.clone()),
-            }
-        }
-    }
     // ---- supply conservation per mint: Σ balance changes = minted − burned ----
     for (mint, evs) in &mints {
         let accts: Vec<&String> = m.tokens.iter().filter(|(_, t)| &t.mint == mint).map(|(a, _)| a).collect();
@@ -669,6 +785,12 @@ pub fn verify_tx(rpc_result: &Value, signature: &str) -> TxVerification {
     }
     v.fee_hypotheses.sort();
     v.fee_hypotheses.dedup();
+    for c in checks.iter_mut() {
+        c.instruction = match mapping.get(c.event_index) {
+            Some(Ok((ix, def))) => Some(format!("{} {} ({})", m.ix_ref(*ix), def.name, short(&m.ixs[*ix].program_id))),
+            _ => None,
+        };
+    }
     v.checks = checks;
     let hard = || v.checks.iter().filter(|c| c.hard);
     v.passed = hard().any(|c| c.outcome == Outcome::Pass) && hard().all(|c| c.outcome != Outcome::Fail) && v.decode_warnings.is_empty();
@@ -728,6 +850,10 @@ pub struct VenueReport {
     pub trade_events: u64,
     pub duplicate_emissions_merged: u64,
     pub events_fully_verified: u64,
+    #[serde(default)]
+    pub fully_verified_buys: u64,
+    #[serde(default)]
+    pub fully_verified_sells: u64,
     pub events_with_failures: u64,
     pub events_inconclusive: u64,
     pub checks_passed: u64,
@@ -857,6 +983,7 @@ pub fn summarize(results: &[TxVerification], min_events: u64) -> VerificationSum
     }
     for (venue, vr) in s.venues.iter_mut() {
         let (buys, sells) = sides.get(venue).copied().unwrap_or_default();
+        (vr.fully_verified_buys, vr.fully_verified_sells) = (buys, sells);
         (vr.status, vr.reason) = if vr.checks_failed > 0 {
             ("MISMATCH".into(), format!("{} hard check(s) failed; see failures_by_check", vr.checks_failed))
         } else if vr.events_fully_verified >= min_events && buys > 0 && sells > 0 {

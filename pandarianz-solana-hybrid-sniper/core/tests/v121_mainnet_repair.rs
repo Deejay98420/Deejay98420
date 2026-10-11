@@ -175,7 +175,7 @@ fn fee_reconciliation_uses_observed_transfers_and_sdk_formula() {
         assert_eq!(outcome(&v, "trade.protocol_fee_observed"), vec![Outcome::Pass], "{:#?}", v.checks);
         assert_eq!(outcome(&v, "trade.creator_fee_observed"), vec![Outcome::Pass]);
         assert_eq!(outcome(&v, "trade.protocol_fee_formula"), vec![Outcome::Pass]);
-        assert_eq!(v.fee_hypotheses, vec!["protocol_fee_to_fee_recipient"]);
+        assert_eq!(v.fee_hypotheses, vec![if tr.is_buy { "1_recipient(s):parsed_transfers" } else { "1_recipient(s):exclusive_balance" }]);
     }
     // event fee that is not ceil(sol × bps) → formula FAIL with the implied rate in the detail
     let mut bad = t.clone();
